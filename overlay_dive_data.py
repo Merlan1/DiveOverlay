@@ -17,7 +17,7 @@ import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import cv2
 
@@ -302,6 +302,9 @@ def process_video(
     samples: List[DiveSample],
     times: List[float],
     codec: str = "auto",
+    swap_rb: bool = False,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    progress_interval_frames: int = 10,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -313,12 +316,19 @@ def process_video(
     if not fps or not math.isfinite(fps) or fps <= 0:
         fps = 30.0
 
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames < 0:
+        total_frames = 0
+
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     writer, used_codec = open_video_writer(output_path, fps, width, height, codec)
 
     frame_idx = 0
+    if progress_callback:
+        progress_callback(0, total_frames)
+
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -345,12 +355,24 @@ def process_video(
             lines = ["Keine Daten"]
 
         draw_overlay(frame, lines)
-        writer.write(frame)
+        if swap_rb:
+            out_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            writer.write(out_frame)
+        else:
+            writer.write(frame)
         frame_idx += 1
+
+        if progress_callback and progress_interval_frames > 0 and frame_idx % progress_interval_frames == 0:
+            progress_callback(frame_idx, total_frames)
 
     cap.release()
     writer.release()
+
+    if progress_callback:
+        progress_callback(frame_idx, total_frames)
+
     print(f"Codec: {used_codec}")
+    print(f"Swap RB: {swap_rb}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -386,6 +408,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="auto",
         help="Video-Codec: auto, avc1, H264, mp4v, XVID, MJPG",
+    )
+    parser.add_argument(
+        "--swap-rb",
+        action="store_true",
+        help="Tauscht Rot/Blau der Video-Frames (Fix bei blauer Haut)",
     )
     parser.add_argument(
         "--clip",
@@ -429,6 +456,7 @@ def main() -> int:
             samples=samples,
             times=times,
             codec=args.codec,
+            swap_rb=args.swap_rb,
         )
         print(f"[{i}/{len(jobs)}] Fertig: {job.output_path}")
 

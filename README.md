@@ -40,10 +40,12 @@ In der GUI:
 - CSV-Datei auswaehlen
 - Felder setzen (z. B. `time,depth,temp`)
 - Bei Bedarf Codec waehlen (`auto` empfohlen, sonst z. B. `avc1` oder `H264`)
+- Falls Hauttoene blau wirken: `Rot/Blau tauschen (Farbfix)` aktivieren
 - Clips einzeln hinzufuegen (Video, Video-Sync, CSV-Sync, Output)
 - Mit `Sync Vorschau` den Frame an der Sync-Stelle inkl. Overlay kontrollieren
 - In der Vorschau mit `-0.5s` / `+0.5s` den Sync feinjustieren
 - Verarbeitung starten
+- Fortschritt wird als Prozentbalken waehrend der Verarbeitung angezeigt
 
 ### Einzelner Clip
 
@@ -98,6 +100,7 @@ Beispiel:
 - `--fields time,depth,temp,pressure,hr` : welche Werte eingeblendet werden
 - `--clip "video|video_sync|csv_sync[|out]"` : mehrfach nutzbar fuer Multi-Clip
 - `--codec auto|avc1|H264|mp4v|XVID|MJPG` : bevorzugter Video-Codec
+- `--swap-rb` : tauscht Rot/Blau im Ausgabevideo (hilft bei Farbkanal-Problem)
 
 Zulaessige Felder:
 
@@ -119,3 +122,4 @@ python overlay_dive_data.py --csv dive.csv --video input.mp4 --video-sync-sec 0 
 - Fehlende CSV-Werte (z. B. Temperatur in einzelnen Zeilen) werden automatisch ausgelassen.
 - Es wird immer der letzte bekannte Messwert verwendet (stabil fuer 10s-Logging).
 - Wenn Farben in der Ausgabe komisch aussehen, zuerst `--codec avc1` oder `--codec H264` testen (GUI: Codec-Auswahl).
+- Wenn Haut blau wirkt oder Rot/Blau vertauscht erscheinen, `--swap-rb` nutzen (GUI: `Rot/Blau tauschen`).

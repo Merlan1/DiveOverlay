@@ -127,7 +127,10 @@ class App:
         self.csv_var = tk.StringVar()
         self.fields_var = tk.StringVar(value="time,depth,temp,pressure,hr")
         self.codec_var = tk.StringVar(value="auto")
+        self.swap_rb_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Bereit")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_text_var = tk.StringVar(value="0%")
         self.entries: list[ClipEntry] = []
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
@@ -162,6 +165,10 @@ class App:
         )
         codec_combo.grid(row=3, column=1, sticky="w")
         codec_combo.current(0)
+
+        ttk.Checkbutton(top, text="Rot/Blau tauschen (Farbfix)", variable=self.swap_rb_var).grid(
+            row=4, column=1, sticky="w", pady=(8, 0)
+        )
 
         top.columnconfigure(0, weight=1)
 
@@ -199,6 +206,12 @@ class App:
         self.run_button = ttk.Button(run_row, text="Verarbeitung starten", command=self._start_processing)
         self.run_button.pack(side="left")
         ttk.Label(run_row, textvariable=self.status_var).pack(side="left", padx=(12, 0))
+
+        progress_row = ttk.Frame(bottom)
+        progress_row.pack(fill="x", pady=(8, 0))
+        self.progress_bar = ttk.Progressbar(progress_row, maximum=100, variable=self.progress_var)
+        self.progress_bar.pack(side="left", fill="x", expand=True)
+        ttk.Label(progress_row, textvariable=self.progress_text_var, width=6).pack(side="left", padx=(8, 0))
 
         self.log_box = tk.Text(bottom, height=10, wrap="word", state="disabled")
         self.log_box.pack(fill="both", expand=True, pady=(8, 0))
@@ -292,6 +305,8 @@ class App:
             frame = self._extract_frame_at_second(entry.video_path, entry.video_sync_sec)
             lines = self._build_overlay_lines(fields, samples, times, csv_sync_sec)
             core.draw_overlay(frame, lines)
+            if self.swap_rb_var.get():
+                frame = core.cv2.cvtColor(frame, core.cv2.COLOR_BGR2RGB)
             rgb = self._prepare_preview_frame(frame)
             self._show_preview_window(rgb, idx, lines)
         except Exception as exc:
@@ -414,6 +429,11 @@ class App:
         state = "disabled" if running else "normal"
         self.run_button.configure(state=state)
 
+    def _set_progress(self, percent: float) -> None:
+        clipped = max(0.0, min(100.0, percent))
+        self.progress_var.set(clipped)
+        self.progress_text_var.set(f"{int(round(clipped))}%")
+
     def _log(self, text: str) -> None:
         self.log_queue.put(text)
 
@@ -451,6 +471,7 @@ class App:
             return
 
         codec = self.codec_var.get().strip() or "auto"
+        swap_rb = self.swap_rb_var.get()
 
         for entry in self.entries:
             if not entry.video_path.exists():
@@ -459,20 +480,38 @@ class App:
 
         self._set_running(True)
         self.status_var.set("Verarbeite...")
+        self._set_progress(0.0)
         self._log("Starte Verarbeitung...")
 
         self.worker_thread = threading.Thread(
             target=self._run_worker,
-            args=(csv_path, fields, list(self.entries), codec),
+            args=(csv_path, fields, list(self.entries), codec, swap_rb),
             daemon=True,
         )
         self.worker_thread.start()
 
-    def _run_worker(self, csv_path: Path, fields: list[str], entries: list[ClipEntry], codec: str) -> None:
+    def _run_worker(self, csv_path: Path, fields: list[str], entries: list[ClipEntry], codec: str, swap_rb: bool) -> None:
         try:
             samples = core.load_samples(csv_path)
             times = [s.elapsed_sec for s in samples]
             total = len(entries)
+
+            clip_frame_totals: list[int] = []
+            for entry in entries:
+                cap = core.cv2.VideoCapture(str(entry.video_path))
+                if not cap.isOpened():
+                    raise RuntimeError(f"Konnte Video nicht öffnen: {entry.video_path}")
+                frames = int(cap.get(core.cv2.CAP_PROP_FRAME_COUNT))
+                cap.release()
+                if frames < 0:
+                    frames = 0
+                clip_frame_totals.append(frames)
+
+            total_frames_all = sum(clip_frame_totals)
+            if total_frames_all <= 0:
+                total_frames_all = total
+
+            base_done_frames = 0
 
             for idx, entry in enumerate(entries, start=1):
                 self._log(f"[{idx}/{total}] {entry.video_path.name} -> {entry.output_path.name}")
@@ -482,6 +521,18 @@ class App:
                     video_sync_sec=entry.video_sync_sec,
                     csv_sync_sec=core.parse_duration_to_seconds(entry.csv_sync_mmss),
                 )
+
+                clip_total_frames = clip_frame_totals[idx - 1]
+
+                def on_progress(processed_frames: int, reported_total_frames: int) -> None:
+                    effective_clip_total = reported_total_frames if reported_total_frames > 0 else clip_total_frames
+                    if effective_clip_total <= 0:
+                        effective_clip_total = 1
+                    effective_processed = min(max(processed_frames, 0), effective_clip_total)
+                    global_done = base_done_frames + effective_processed
+                    percent = (global_done * 100.0) / total_frames_all
+                    self.root.after(0, lambda p=percent: self._set_progress(p))
+
                 core.process_video(
                     video_path=job.video_path,
                     output_path=job.output_path,
@@ -491,7 +542,12 @@ class App:
                     samples=samples,
                     times=times,
                     codec=codec,
+                    swap_rb=swap_rb,
+                    progress_callback=on_progress,
                 )
+
+                base_done_frames += max(clip_total_frames, 1)
+                self.root.after(0, lambda p=(base_done_frames * 100.0) / total_frames_all: self._set_progress(p))
                 self._log(f"[{idx}/{total}] Fertig: {job.output_path}")
 
             self._log("Alle Clips wurden verarbeitet.")
@@ -502,6 +558,7 @@ class App:
 
     def _on_done_success(self) -> None:
         self._set_running(False)
+        self._set_progress(100.0)
         self.status_var.set("Fertig")
         messagebox.showinfo("Fertig", "Alle Clips wurden erfolgreich verarbeitet.")
 
