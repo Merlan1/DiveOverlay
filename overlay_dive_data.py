@@ -219,19 +219,31 @@ def parse_fields(value: str) -> List[str]:
 
 
 def open_video_writer(output_path: Path, fps: float, width: int, height: int, codec: str):
+    output_path = output_path.with_suffix(".mp4")
+
     codec = (codec or "auto").strip()
+
+    fourcc_map = {
+        "avc1": cv2.VideoWriter_fourcc(*"avc1"),
+        "H264": cv2.VideoWriter_fourcc(*"H264"),
+        "h264": cv2.VideoWriter_fourcc(*"H264"),
+        "mp4v": cv2.VideoWriter_fourcc(*"mp4v"),
+        "XVID": cv2.VideoWriter_fourcc(*"XVID"),
+        "MJPG": cv2.VideoWriter_fourcc(*"MJPG"),
+        "mjpg": cv2.VideoWriter_fourcc(*"MJPG"),
+    }
+
     if codec.lower() == "auto":
-        if output_path.suffix.lower() == ".mp4":
-            candidates = ["avc1", "H264", "mp4v"]
-        else:
-            candidates = ["XVID", "MJPG", "mp4v"]
+        order = ["avc1", "H264", "mp4v"]
     else:
-        candidates = [codec]
+        order = [codec]
 
     attempted: List[str] = []
-    for cc in candidates:
+    for cc in order:
+        fourcc = fourcc_map.get(cc)
+        if fourcc is None:
+            continue
         attempted.append(cc)
-        fourcc = cv2.VideoWriter_fourcc(*cc)
         writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
         if writer.isOpened():
             return writer, cc
@@ -447,6 +459,7 @@ def main() -> int:
     times = [s.elapsed_sec for s in samples]
 
     for i, job in enumerate(jobs, start=1):
+        job.output_path = job.output_path.with_suffix(".mp4")
         process_video(
             video_path=job.video_path,
             output_path=job.output_path,
