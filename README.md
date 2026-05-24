@@ -4,7 +4,15 @@ Dieses Skript blendet die Werte aus einer Tauchgang-CSV als Overlay in ein Video
 
 Es unterstuetzt jetzt auch mehrere Videoclips mit Pausen dazwischen. Jeder Clip bekommt einen eigenen Sync-Punkt.
 
-Datei: `overlay_dive_data.py`
+Dateien:
+- overlay_dive_data.py (CLI)
+- overlay_dive_data_gui.py (GUI)
+
+## Screenshots
+
+Overlay-Beispiel aus einem gerenderten Clip:
+
+![Overlay Beispiel](screenshots/Preview.png)
 
 ## Voraussetzungen
 
@@ -101,6 +109,7 @@ Beispiel:
 - `--clip "video|video_sync|csv_sync[|out]"` : mehrfach nutzbar fuer Multi-Clip
 - `--codec auto|avc1|H264|mp4v|XVID|MJPG` : bevorzugter Video-Codec
 - `--swap-rb` : tauscht Rot/Blau im Ausgabevideo (hilft bei Farbkanal-Problem)
+- `--show-graph` : zeigt ein kleines Tiefenprofil im Video
 
 Zulaessige Felder:
 
