@@ -128,12 +128,15 @@ class App:
         self.fields_var = tk.StringVar(value="time,depth,temp,pressure,hr")
         self.codec_var = tk.StringVar(value="auto")
         self.swap_rb_var = tk.BooleanVar(value=False)
+        self.show_graph_var = tk.BooleanVar(value=False)
+        self.column_map_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Bereit")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0%")
         self.entries: list[ClipEntry] = []
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
+        self.cancel_event = threading.Event()
         self.preview_window: tk.Toplevel | None = None
         self.preview_image: tk.PhotoImage | None = None
         self.preview_clip_index: int | None = None
@@ -155,6 +158,11 @@ class App:
         ttk.Label(top, text="Felder (time,depth,temp,pressure,hr)").grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.fields_var, width=50).grid(row=3, column=0, sticky="w")
 
+        ttk.Label(top, text="CSV Spaltenzuordnung (z.B. time=TIME,depth=Depth)").grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Entry(top, textvariable=self.column_map_var, width=70).grid(row=5, column=0, sticky="w")
+
         ttk.Label(top, text="Codec (auto, avc1, H264, mp4v, XVID, MJPG)").grid(row=2, column=1, sticky="w", pady=(8, 0))
         codec_combo = ttk.Combobox(
             top,
@@ -168,6 +176,9 @@ class App:
 
         ttk.Checkbutton(top, text="Rot/Blau tauschen (Farbfix)", variable=self.swap_rb_var).grid(
             row=4, column=1, sticky="w", pady=(8, 0)
+        )
+        ttk.Checkbutton(top, text="Tiefenprofil anzeigen", variable=self.show_graph_var).grid(
+            row=5, column=1, sticky="w", pady=(6, 0)
         )
 
         top.columnconfigure(0, weight=1)
@@ -205,6 +216,8 @@ class App:
         run_row.pack(fill="x")
         self.run_button = ttk.Button(run_row, text="Verarbeitung starten", command=self._start_processing)
         self.run_button.pack(side="left")
+        self.cancel_button = ttk.Button(run_row, text="Abbruch", command=self._cancel_processing, state="disabled")
+        self.cancel_button.pack(side="left", padx=(8, 0))
         ttk.Label(run_row, textvariable=self.status_var).pack(side="left", padx=(12, 0))
 
         progress_row = ttk.Frame(bottom)
@@ -298,13 +311,16 @@ class App:
 
         try:
             fields = core.parse_fields(self.fields_var.get().strip())
+            column_map = core.parse_column_map(self.column_map_var.get().strip())
             csv_sync_sec = core.parse_duration_to_seconds(entry.csv_sync_mmss)
-            samples = core.load_samples(csv_path)
+            samples = core.load_samples(csv_path, column_map=column_map)
             times = [s.elapsed_sec for s in samples]
 
             frame = self._extract_frame_at_second(entry.video_path, entry.video_sync_sec)
             lines = self._build_overlay_lines(fields, samples, times, csv_sync_sec)
             core.draw_overlay(frame, lines)
+            if self.show_graph_var.get():
+                core.draw_depth_graph(frame, samples, times, csv_sync_sec)
             if self.swap_rb_var.get():
                 frame = core.cv2.cvtColor(frame, core.cv2.COLOR_BGR2RGB)
             rgb = self._prepare_preview_frame(frame)
@@ -320,11 +336,15 @@ class App:
             return
 
         entry = self.entries[idx]
-        new_sync = max(0.0, entry.video_sync_sec + delta_sec)
+        try:
+            csv_sync_sec = core.parse_duration_to_seconds(entry.csv_sync_mmss)
+        except Exception:
+            csv_sync_sec = 0.0
+        new_csv_sync = max(0.0, csv_sync_sec + delta_sec)
         self.entries[idx] = ClipEntry(
             video_path=entry.video_path,
-            video_sync_sec=new_sync,
-            csv_sync_mmss=entry.csv_sync_mmss,
+            video_sync_sec=entry.video_sync_sec,
+            csv_sync_mmss=core.format_duration(new_csv_sync),
             output_path=entry.output_path,
         )
         self._refresh_tree()
@@ -414,8 +434,14 @@ class App:
 
         controls = ttk.Frame(frame)
         controls.pack(anchor="w", pady=(0, 6))
-        ttk.Button(controls, text="-0.5s", command=lambda: self._adjust_selected_sync(-0.5)).pack(side="left", padx=(0, 6))
-        ttk.Button(controls, text="+0.5s", command=lambda: self._adjust_selected_sync(0.5)).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="-1 min", command=lambda: self._adjust_selected_sync(-60)).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="-30 s", command=lambda: self._adjust_selected_sync(-30)).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="-5 s", command=lambda: self._adjust_selected_sync(-5)).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="-0.5 s", command=lambda: self._adjust_selected_sync(-0.5)).pack(side="left", padx=(0, 12))
+        ttk.Button(controls, text="+0.5 s", command=lambda: self._adjust_selected_sync(0.5)).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="+5 s", command=lambda: self._adjust_selected_sync(5)).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="+30 s", command=lambda: self._adjust_selected_sync(30)).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="+1 min", command=lambda: self._adjust_selected_sync(60)).pack(side="left", padx=(0, 6))
         ttk.Button(controls, text="Neu laden", command=lambda: self._render_preview_for_index(clip_index)).pack(side="left")
 
         preview_label = ttk.Label(frame, image=self.preview_image)
@@ -428,6 +454,16 @@ class App:
     def _set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
         self.run_button.configure(state=state)
+        if running:
+            self.cancel_button.configure(state="normal")
+        else:
+            self.cancel_button.configure(state="disabled")
+
+    def _cancel_processing(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.cancel_event.set()
+            self._log("Abbruch angefordert...")
+            self.status_var.set("Abbruch...")
 
     def _set_progress(self, percent: float) -> None:
         clipped = max(0.0, min(100.0, percent))
@@ -466,18 +502,21 @@ class App:
 
         try:
             fields = core.parse_fields(self.fields_var.get().strip())
+            column_map = core.parse_column_map(self.column_map_var.get().strip())
         except Exception as exc:
-            messagebox.showerror("Fehler", f"Feldliste ungültig: {exc}")
+            messagebox.showerror("Fehler", f"Feldliste/Spaltenzuordnung ungültig: {exc}")
             return
 
         codec = self.codec_var.get().strip() or "auto"
         swap_rb = self.swap_rb_var.get()
+        show_graph = self.show_graph_var.get()
 
         for entry in self.entries:
             if not entry.video_path.exists():
                 messagebox.showerror("Fehler", f"Video nicht gefunden: {entry.video_path}")
                 return
 
+        self.cancel_event.clear()
         self._set_running(True)
         self.status_var.set("Verarbeite...")
         self._set_progress(0.0)
@@ -485,14 +524,23 @@ class App:
 
         self.worker_thread = threading.Thread(
             target=self._run_worker,
-            args=(csv_path, fields, list(self.entries), codec, swap_rb),
+            args=(csv_path, fields, list(self.entries), codec, swap_rb, show_graph, column_map),
             daemon=True,
         )
         self.worker_thread.start()
 
-    def _run_worker(self, csv_path: Path, fields: list[str], entries: list[ClipEntry], codec: str, swap_rb: bool) -> None:
+    def _run_worker(
+        self,
+        csv_path: Path,
+        fields: list[str],
+        entries: list[ClipEntry],
+        codec: str,
+        swap_rb: bool,
+        show_graph: bool,
+        column_map: dict[str, str],
+    ) -> None:
         try:
-            samples = core.load_samples(csv_path)
+            samples = core.load_samples(csv_path, column_map=column_map)
             times = [s.elapsed_sec for s in samples]
             total = len(entries)
 
@@ -543,15 +591,25 @@ class App:
                     times=times,
                     codec=codec,
                     swap_rb=swap_rb,
+                    show_graph=show_graph,
                     progress_callback=on_progress,
+                    stop_check=lambda: self.cancel_event.is_set(),
                 )
+
+                if self.cancel_event.is_set():
+                    self._log("Abbruch: Verarbeitung gestoppt.")
+                    break
 
                 base_done_frames += max(clip_total_frames, 1)
                 self.root.after(0, lambda p=(base_done_frames * 100.0) / total_frames_all: self._set_progress(p))
                 self._log(f"[{idx}/{total}] Fertig: {job.output_path}")
 
-            self._log("Alle Clips wurden verarbeitet.")
-            self.root.after(0, self._on_done_success)
+            if self.cancel_event.is_set():
+                self._log("Verarbeitung abgebrochen.")
+                self.root.after(0, self._on_done_cancelled)
+            else:
+                self._log("Alle Clips wurden verarbeitet.")
+                self.root.after(0, self._on_done_success)
         except Exception as exc:
             self._log(f"Fehler: {exc}")
             self.root.after(0, lambda: self._on_done_error(str(exc)))
@@ -561,6 +619,11 @@ class App:
         self._set_progress(100.0)
         self.status_var.set("Fertig")
         messagebox.showinfo("Fertig", "Alle Clips wurden erfolgreich verarbeitet.")
+
+    def _on_done_cancelled(self) -> None:
+        self._set_running(False)
+        self.status_var.set("Abgebrochen")
+        messagebox.showinfo("Abgebrochen", "Verarbeitung wurde abgebrochen.")
 
     def _on_done_error(self, error: str) -> None:
         self._set_running(False)
