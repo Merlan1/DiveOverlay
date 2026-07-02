@@ -1,6 +1,11 @@
 # Tauchdaten-Overlay (Rust)
 
-Dieses Tool blendet die Werte aus einer Tauchgang-CSV als Overlay in ein Video ein: Tiefe, Temperatur, Druck, Puls und Tauchzeit. Es unterstuetzt mehrere Videoclips mit Pausen dazwischen, jeder Clip mit eigenem Sync-Punkt, sowie automatisches Sync ueber die Aufnahmezeit der MP4-Dateien.
+Dieses Tool blendet die Werte aus einer Tauchgang-CSV in ein Video ein: Tiefe, Temperatur, Druck, Puls und Tauchzeit. Es unterstuetzt mehrere Videoclips mit Pausen dazwischen, jeder Clip mit eigenem Sync-Punkt, sowie automatisches Sync ueber die Aufnahmezeit der MP4-Dateien.
+
+Zwei Ausgabe-Modi stehen zur Wahl:
+
+- **Overlay** (Standard): die Werte werden fest in die Video-Pixel eingebrannt.
+- **Untertitel**: die Werte werden stattdessen als weiche Untertitelspur (SRT/`mov_text`) geschrieben, die sich im Player nachtraeglich an- und ausschalten laesst. Video/Audio werden dabei verlustfrei kopiert (kein Re-Encode), zusaetzlich entsteht eine `.srt`-Sidecar-Datei neben der Ausgabe.
 
 Ehemals ein Python/OpenCV-Skript, jetzt ein Rust-Workspace, der fuer Dekodierung/Encodierung `ffmpeg`/`ffprobe` als Subprozess nutzt (kein OpenCV/libav-Linking noetig).
 
@@ -35,7 +40,7 @@ Binaries landen in `target/release/dive_overlay_cli(.exe)` und `target/release/d
 cargo test --workspace
 ```
 
-Die Test-Suite (35 Tests) deckt CSV-Parsing, Sample-Lookup, Overlay-Zeichnen, ffprobe-Parsing sowie die volle ffmpeg-Pipeline (Dekodieren/Overlay/Encodieren+Audio-Mux, Abbruch, Multi-Clip-Auto-Sync) ab. Ein Teil der Tests synthetisiert Testclips per `ffmpeg -f lavfi` und benoetigt daher ein funktionierendes `ffmpeg` im PATH.
+Die Test-Suite deckt CSV-Parsing, Sample-Lookup, Overlay-Zeichnen, Untertitel-Generierung, ffprobe-Parsing sowie die volle ffmpeg-Pipeline ab (Dekodieren/Overlay/Encodieren+Audio-Mux, Untertitel-Remux, Abbruch, Multi-Clip-Auto-Sync). Ein Teil der Tests synthetisiert Testclips per `ffmpeg -f lavfi` und benoetigt daher ein funktionierendes `ffmpeg` im PATH.
 
 ## Erwartetes CSV-Format
 
@@ -59,7 +64,8 @@ In der GUI:
 
 - CSV-Datei auswaehlen
 - Felder setzen (z. B. `time,depth,temp`)
-- Bei Bedarf Codec waehlen (`auto` empfohlen, sonst z. B. `avc1` oder `H264`)
+- Modus waehlen: `Overlay (eingebrannt)` oder `Untertitel (an/aus schaltbar)`
+- Im Overlay-Modus bei Bedarf Codec waehlen (`auto` empfohlen, sonst z. B. `avc1` oder `H264`) und Tiefenprofil aktivieren
 - Clips einzeln hinzufuegen (Video, Video-Sync, CSV-Sync, Output)
 - Mit `Sync Vorschau` den Frame an der Sync-Stelle inkl. Overlay kontrollieren
 - In der Vorschau mit `-0.5s` / `+0.5s` (bis `-1 min` / `+1 min`) den Sync feinjustieren
@@ -77,6 +83,17 @@ cargo run --release --bin dive_overlay_cli -- \
 ```
 
 Danach entsteht standardmaessig: `input_overlay.mp4`
+
+Fuer die Untertitel-Variante statt eingebranntem Overlay einfach `--mode subtitles` anhaengen:
+
+```bash
+cargo run --release --bin dive_overlay_cli -- \
+  --csv dive.csv \
+  --video input.mp4 \
+  --video-sync-sec 3.2 \
+  --csv-sync-mmss 0:10 \
+  --mode subtitles
+```
 
 ### Mehrere Clips (mit Pausen)
 
@@ -138,8 +155,9 @@ Beispiel:
 - `--fields time,depth,temp,pressure,hr` : welche Werte eingeblendet werden
 - `--column-map time=TIME,depth=Depth` : manuelle Spaltenzuordnung, falls die Auto-Erkennung daneben liegt
 - `--clip "video|video_sync|csv_sync[|out]"` : mehrfach nutzbar fuer Multi-Clip
-- `--codec auto|avc1|H264|mp4v|XVID|MJPG` : Video-Codec (wird auf den passenden ffmpeg-Encoder abgebildet, `auto`/`H264`/`avc1` -> `libx264`)
-- `--show-graph` : zeigt ein kleines Tiefenprofil im Video
+- `--codec auto|avc1|H264|mp4v|XVID|MJPG` : Video-Codec (wird auf den passenden ffmpeg-Encoder abgebildet, `auto`/`H264`/`avc1` -> `libx264`), gilt nur im Overlay-Modus
+- `--show-graph` : zeigt ein kleines Tiefenprofil im Video, gilt nur im Overlay-Modus
+- `--mode overlay|subtitles` : `overlay` (Standard) brennt die Werte in die Pixel ein; `subtitles` schreibt sie stattdessen als weiche, im Player an/aus schaltbare Untertitelspur (Video/Audio werden verlustfrei per `-c copy` kopiert, zusaetzlich entsteht eine `.srt`-Datei neben der Ausgabe). Das Tiefenprofil (`--show-graph`) gibt es in diesem Modus nicht, da Untertitel nur Text darstellen koennen.
 - `--auto-sync`, `--base-clip`, `--base-video-sync-sec`, `--base-csv-datetime` : automatisches Sync (siehe oben)
 
 Zulaessige Felder:
@@ -162,3 +180,4 @@ cargo run --release --bin dive_overlay_cli -- --csv dive.csv --video input.mp4 -
 - Fehlende CSV-Werte (z. B. Temperatur in einzelnen Zeilen) werden automatisch ausgelassen.
 - Es wird immer der letzte bekannte Messwert verwendet (stabil fuer 10s-Logging).
 - Die Original-Tonspur des Videos bleibt im Ergebnis erhalten (AAC, 192 kbit/s), sofern vorhanden.
+- Im Untertitel-Modus haengt es vom Player/Container ab, ob sich die eingebettete Spur an/aus schalten laesst — die zusaetzlich geschriebene `.srt`-Datei laesst sich notfalls auch separat laden.
