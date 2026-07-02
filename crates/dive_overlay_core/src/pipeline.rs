@@ -11,6 +11,7 @@ use crate::error::CoreError;
 use crate::ffprobe::probe_video;
 use crate::model::{ClipJob, DiveSample, Field};
 use crate::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay};
+use crate::subtitle::build_srt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -46,11 +47,33 @@ impl Codec {
     }
 }
 
+/// Selects how dive telemetry is attached to the output video. `Overlay`
+/// burns it into the pixels (the original behavior); `Subtitles` writes it
+/// as a soft subtitle track instead, so the video is re-muxed losslessly
+/// (`-c copy`, no decode/re-encode) and a player can toggle the info on and
+/// off after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    Overlay,
+    Subtitles,
+}
+
+impl OutputMode {
+    pub fn parse(s: &str) -> Option<OutputMode> {
+        match s.trim().to_lowercase().as_str() {
+            "overlay" => Some(OutputMode::Overlay),
+            "subtitles" | "subtitle" => Some(OutputMode::Subtitles),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProcessingOptions {
     pub fields: Vec<Field>,
     pub codec: Codec,
     pub show_graph: bool,
+    pub mode: OutputMode,
 }
 
 fn spawn_stderr_drain(mut pipe: impl Read + Send + 'static, label: &'static str) {
@@ -159,6 +182,10 @@ pub fn process_clip(
     stop_flag: &Arc<AtomicBool>,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<bool, CoreError> {
+    if options.mode == OutputMode::Subtitles {
+        return process_clip_subtitles(job, samples, times, options, stop_flag, progress);
+    }
+
     if !job.video_path.exists() {
         return Err(CoreError::VideoNotFound(job.video_path.clone()));
     }
@@ -244,6 +271,105 @@ pub fn process_clip(
 
     progress(frame_idx, total_estimate.max(frame_idx));
     Ok(!cancelled)
+}
+
+/// Writes dive telemetry as a soft subtitle track instead of burning it into
+/// the pixels: probes the clip's duration, renders one SRT cue per second via
+/// `build_srt`, and re-muxes it into the output alongside a lossless
+/// `-c copy` of the original streams (no decode/encode loop needed, since no
+/// pixel touches the frames). A sidecar `.srt` is written next to the output
+/// too, since embedded-subtitle toggle support varies by player/container.
+pub fn process_clip_subtitles(
+    job: &ClipJob,
+    samples: &[DiveSample],
+    times: &[f64],
+    options: &ProcessingOptions,
+    stop_flag: &Arc<AtomicBool>,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<bool, CoreError> {
+    if !job.video_path.exists() {
+        return Err(CoreError::VideoNotFound(job.video_path.clone()));
+    }
+
+    let info = probe_video(&job.video_path)?;
+    let video_duration_sec = info
+        .duration_sec
+        .or_else(|| info.estimated_frames.map(|frames| frames as f64 / info.fps))
+        .unwrap_or(0.0);
+
+    let srt = build_srt(
+        &options.fields,
+        samples,
+        times,
+        job.video_sync_sec,
+        job.csv_sync_sec,
+        video_duration_sec,
+    );
+
+    if let Some(parent) = job.output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let srt_path = job.output_path.with_extension("srt");
+    std::fs::write(&srt_path, &srt)?;
+
+    progress(0, 1);
+
+    let mut child = Command::new("ffmpeg")
+        .args(["-y", "-nostdin", "-v", "error", "-i"])
+        .arg(&job.video_path)
+        .arg("-i")
+        .arg(&srt_path)
+        .args(["-map", "0:v:0", "-map", "0:a:0?", "-map", "1:0"])
+        .args(["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text"])
+        .arg(&job.output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CoreError::Ffmpeg(format!("Remux konnte nicht gestartet werden: {e}")))?;
+
+    if let Some(stdout) = child.stdout.take() {
+        spawn_stderr_drain(stdout, "ffmpeg-subtitle-stdout");
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_stderr_drain(stderr, "ffmpeg-subtitle");
+    }
+
+    let mut cancelled = false;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| CoreError::Ffmpeg(format!("Fehler beim Warten auf ffmpeg: {e}")))?
+        {
+            Some(status) => {
+                if !status.success() {
+                    return Err(CoreError::Ffmpeg(format!("Remux beendete mit Fehler: {status}")));
+                }
+                break;
+            }
+            None => {
+                if stop_flag.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    cancelled = true;
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    if cancelled {
+        let _ = std::fs::remove_file(&job.output_path);
+        let _ = std::fs::remove_file(&srt_path);
+        progress(0, 1);
+        return Ok(false);
+    }
+
+    progress(1, 1);
+    Ok(true)
 }
 
 /// Extracts a single frame at `second` for sync preview, mirroring the
@@ -350,6 +476,7 @@ mod tests {
             fields: vec![Field::Time, Field::Depth, Field::Temp],
             codec: Codec::Auto,
             show_graph: true,
+            mode: OutputMode::Overlay,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -396,6 +523,7 @@ mod tests {
             fields: vec![Field::Depth],
             codec: Codec::Auto,
             show_graph: false,
+            mode: OutputMode::Overlay,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_for_progress = stop_flag.clone();
@@ -409,6 +537,53 @@ mod tests {
 
         assert!(!completed);
         assert!(output.exists());
+    }
+
+    #[test]
+    fn processes_synthetic_clip_in_subtitle_mode_without_reencoding() {
+        let dir = make_test_dir("subtitle_mode");
+        let clip = synth_clip(&dir, "input.mp4", 2, 5);
+        let output = dir.join("output.mp4");
+
+        let job = ClipJob {
+            video_path: clip,
+            output_path: output.clone(),
+            video_sync_sec: 0.0,
+            csv_sync_sec: 0.0,
+            video_start_utc: None,
+        };
+        let samples = vec![sample(0.0, 1.0), sample(1.0, 5.0), sample(2.0, 3.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let options = ProcessingOptions {
+            fields: vec![Field::Time, Field::Depth],
+            codec: Codec::Auto,
+            show_graph: false,
+            mode: OutputMode::Subtitles,
+        };
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let completed = process_clip(&job, &samples, &times, &options, &stop_flag, |_, _| {}).unwrap();
+
+        assert!(completed);
+        assert!(output.exists());
+
+        let srt_path = output.with_extension("srt");
+        assert!(srt_path.exists());
+        let srt_text = std::fs::read_to_string(&srt_path).unwrap();
+        assert!(srt_text.contains("Tiefe: 1.0 m"));
+
+        let info = probe_video(&output).unwrap();
+        assert_eq!(info.width, 160);
+        assert_eq!(info.height, 120);
+
+        let ffprobe_out = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "s", "-show_entries", "stream=codec_type"])
+            .args(["-of", "csv=p=0"])
+            .arg(&output)
+            .output()
+            .unwrap();
+        let has_subtitle = String::from_utf8_lossy(&ffprobe_out.stdout).contains("subtitle");
+        assert!(has_subtitle, "expected a subtitle stream in the muxed output");
     }
 
     #[test]

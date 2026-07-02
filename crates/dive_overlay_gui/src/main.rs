@@ -11,7 +11,7 @@ use dive_overlay_core::csv_data::{
 use dive_overlay_core::ffprobe::probe_video;
 use dive_overlay_core::model::Field;
 use dive_overlay_core::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay};
-use dive_overlay_core::pipeline::{extract_frame_at, process_clip, Codec, ProcessingOptions};
+use dive_overlay_core::pipeline::{extract_frame_at, process_clip, Codec, OutputMode, ProcessingOptions};
 use dive_overlay_core::ClipJob;
 
 mod update_check;
@@ -119,6 +119,7 @@ struct App {
     codec: String,
     column_map: String,
     show_graph: bool,
+    mode: OutputMode,
     entries: Vec<ClipEntry>,
     selected: Option<usize>,
     status: String,
@@ -142,6 +143,7 @@ impl Default for App {
             codec: "auto".to_string(),
             column_map: String::new(),
             show_graph: false,
+            mode: OutputMode::Overlay,
             entries: Vec::new(),
             selected: None,
             status: "Bereit".to_string(),
@@ -261,16 +263,34 @@ impl App {
             ui.text_edit_singleline(&mut self.column_map);
         });
         ui.horizontal(|ui| {
-            ui.label("Codec:");
-            egui::ComboBox::from_id_salt("codec")
-                .selected_text(self.codec.clone())
+            ui.label("Modus:");
+            egui::ComboBox::from_id_salt("mode")
+                .selected_text(match self.mode {
+                    OutputMode::Overlay => "Overlay (eingebrannt)",
+                    OutputMode::Subtitles => "Untertitel (an/aus schaltbar)",
+                })
                 .show_ui(ui, |ui| {
-                    for opt in ["auto", "avc1", "H264", "mp4v", "XVID", "MJPG"] {
-                        ui.selectable_value(&mut self.codec, opt.to_string(), opt);
-                    }
+                    ui.selectable_value(&mut self.mode, OutputMode::Overlay, "Overlay (eingebrannt)");
+                    ui.selectable_value(&mut self.mode, OutputMode::Subtitles, "Untertitel (an/aus schaltbar)");
                 });
-            ui.checkbox(&mut self.show_graph, "Tiefenprofil anzeigen");
         });
+        let subtitle_mode = self.mode == OutputMode::Subtitles;
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!subtitle_mode, |ui| {
+                ui.label("Codec:");
+                egui::ComboBox::from_id_salt("codec")
+                    .selected_text(self.codec.clone())
+                    .show_ui(ui, |ui| {
+                        for opt in ["auto", "avc1", "H264", "mp4v", "XVID", "MJPG"] {
+                            ui.selectable_value(&mut self.codec, opt.to_string(), opt);
+                        }
+                    });
+                ui.checkbox(&mut self.show_graph, "Tiefenprofil anzeigen");
+            });
+        });
+        if subtitle_mode {
+            ui.label("Hinweis: Untertitel-Modus kopiert Video/Audio verlustfrei und schreibt zusätzlich eine .srt Datei neben der Ausgabe.");
+        }
     }
 
     fn ui_clip_table(&mut self, ui: &mut egui::Ui) {
@@ -630,6 +650,7 @@ impl App {
 
         let codec = Codec::parse(&self.codec);
         let show_graph = self.show_graph;
+        let mode = self.mode;
         let entries = self.entries.clone();
 
         self.cancel_flag = Arc::new(AtomicBool::new(false));
@@ -651,6 +672,7 @@ impl App {
                 entries,
                 codec,
                 show_graph,
+                mode,
                 &cancel_flag,
                 &tx,
                 &worker_ctx,
@@ -670,6 +692,7 @@ fn run_worker(
     entries: Vec<ClipEntry>,
     codec: Codec,
     show_graph: bool,
+    mode: OutputMode,
     cancel_flag: &Arc<AtomicBool>,
     tx: &Sender<WorkerEvent>,
     ctx: &egui::Context,
@@ -718,6 +741,7 @@ fn run_worker(
             fields: fields.clone(),
             codec,
             show_graph,
+            mode,
         };
 
         let tx_progress = tx.clone();
@@ -809,6 +833,7 @@ mod tests {
             vec![entry],
             Codec::Auto,
             false,
+            OutputMode::Overlay,
             &cancel_flag,
             &tx,
             &ctx,
@@ -856,6 +881,7 @@ mod tests {
             vec![entry],
             Codec::Auto,
             false,
+            OutputMode::Overlay,
             &cancel_flag,
             &tx,
             &ctx,

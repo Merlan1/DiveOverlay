@@ -5,6 +5,7 @@ pub mod lookup;
 pub mod model;
 pub mod overlay;
 pub mod pipeline;
+pub mod subtitle;
 pub mod sync;
 
 pub use error::{CoreError, CoreResult};

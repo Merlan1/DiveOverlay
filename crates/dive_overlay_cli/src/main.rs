@@ -7,7 +7,7 @@ use clap::Parser;
 
 use dive_overlay_core::csv_data::{load_samples, parse_column_map, parse_duration_to_seconds, parse_fields};
 use dive_overlay_core::ffprobe::ensure_ffmpeg_available;
-use dive_overlay_core::pipeline::{process_clip, Codec, ProcessingOptions};
+use dive_overlay_core::pipeline::{process_clip, Codec, OutputMode, ProcessingOptions};
 use dive_overlay_core::sync::{compute_auto_sync, derive_output_path, parse_clip_spec, AutoSyncParams};
 use dive_overlay_core::ClipJob;
 
@@ -50,6 +50,11 @@ struct Args {
     /// Zeigt kleines Tiefenprofil (Graph) an
     #[arg(long)]
     show_graph: bool,
+
+    /// Ausgabe-Modus: overlay (in Pixel eingebrannt) oder subtitles (weiche,
+    /// im Player an/aus schaltbare Untertitelspur statt Overlay)
+    #[arg(long, default_value = "overlay")]
+    mode: String,
 
     /// Automatisches Sync basierend auf MP4 CreationTime + CSV Datum/Uhrzeit
     #[arg(long)]
@@ -135,10 +140,14 @@ fn main() -> Result<()> {
         compute_auto_sync(&args.csv, &mut jobs, &params)?;
     }
 
+    let mode = OutputMode::parse(&args.mode)
+        .ok_or_else(|| anyhow!("Ungültiger --mode Wert: {} (erwartet: overlay, subtitles)", args.mode))?;
+
     let options = ProcessingOptions {
         fields,
         codec: Codec::parse(&args.codec),
         show_graph: args.show_graph,
+        mode,
     };
     let stop_flag = Arc::new(AtomicBool::new(false));
 

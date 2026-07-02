@@ -42,6 +42,11 @@ pub struct VideoInfo {
     /// never as a decode loop's termination condition.
     pub estimated_frames: Option<u64>,
     pub creation_time: Option<DateTime<Utc>>,
+    /// Container/stream duration in seconds, when ffprobe reports one.
+    /// Independent of `estimated_frames` (which derives from `nb_frames`
+    /// first) -- used for sizing subtitle-cue generation, where we need the
+    /// actual runtime rather than a frame-count estimate.
+    pub duration_sec: Option<f64>,
 }
 
 /// Fails fast with a clear message if ffmpeg/ffprobe aren't on PATH, instead
@@ -135,12 +140,19 @@ fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
         .and_then(|f| f.tags.get("creation_time"))
         .and_then(|s| parse_creation_time(s).ok());
 
+    let duration_sec = video_stream
+        .duration
+        .as_deref()
+        .or_else(|| parsed.format.as_ref().and_then(|f| f.duration.as_deref()))
+        .and_then(|s| s.parse::<f64>().ok());
+
     Ok(VideoInfo {
         width,
         height,
         fps,
         estimated_frames,
         creation_time,
+        duration_sec,
     })
 }
 
