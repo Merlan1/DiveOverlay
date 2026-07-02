@@ -1,0 +1,16 @@
+[package]
+name = "dive_overlay_gui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dive_overlay_gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+dive_overlay_core = { path = "../dive_overlay_core" }
+eframe = "0.35.0"
+egui = "0.35.0"
+egui_extras = { version = "0.35.0", features = ["image"] }
+rfd = "0.17.2"
