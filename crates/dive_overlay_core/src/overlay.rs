@@ -48,12 +48,11 @@ pub fn build_overlay_lines(fields: &[Field], samples: &[DiveSample], times: &[f6
     }
 
     if let Some(idx) = choose_sample_index(times, dive_sec) {
-        let sample = &samples[idx];
         for &field in fields {
             if field == Field::Time {
                 continue;
             }
-            if let Some(value) = value_for_field(sample, field) {
+            if let Some(value) = last_known_value(&samples[..=idx], field) {
                 lines.push(value);
             }
         }
@@ -63,6 +62,15 @@ pub fn build_overlay_lines(fields: &[Field], samples: &[DiveSample], times: &[f6
         lines.push("Keine Daten".to_string());
     }
     lines
+}
+
+/// Fields like temperature aren't logged every sample, so walk backward from
+/// the current sample to the most recent one that actually has this field.
+fn last_known_value(samples_up_to_now: &[DiveSample], field: Field) -> Option<String> {
+    samples_up_to_now
+        .iter()
+        .rev()
+        .find_map(|sample| value_for_field(sample, field))
 }
 
 pub fn draw_overlay(img: &mut RgbImage, lines: &[String]) {
@@ -146,9 +154,22 @@ pub fn draw_depth_graph(img: &mut RgbImage, samples: &[DiveSample], times: &[f64
         draw_line_segment_mut(img, pair[0], pair[1], Rgb([100, 220, 255]));
     }
 
-    let label = format!("Depth {min_depth:.1}-{max_depth:.1}m");
-    let label_scale = PxScale::from(16.0);
-    draw_text_mut(img, Rgb([200, 200, 200]), x + 6, (y - 20).max(0), label_scale, &font(), &label);
+    let axis_scale = PxScale::from(14.0);
+    let axis_font = font();
+    let max_label = format!("{max_depth:.1}m");
+    let min_label = format!("{min_depth:.1}m");
+    let (_, min_label_h) = text_size(axis_scale, &axis_font, &min_label);
+    // min_depth (shallowest) plots at the top of the box, max_depth (deepest) at the bottom.
+    draw_text_mut(img, Rgb([200, 200, 200]), x + 4, y + 2, axis_scale, &axis_font, &min_label);
+    draw_text_mut(
+        img,
+        Rgb([200, 200, 200]),
+        x + 4,
+        y + graph_h as i32 - min_label_h as i32 - 2,
+        axis_scale,
+        &axis_font,
+        &max_label,
+    );
 }
 
 #[cfg(test)]
@@ -178,6 +199,17 @@ mod tests {
         let lines = build_overlay_lines(&[Field::Time, Field::Depth], &samples, &times, 10.0);
         assert_eq!(lines[0], "Tauchzeit: 00:10");
         assert_eq!(lines[1], "Tiefe: 1.5 m");
+    }
+
+    #[test]
+    fn build_overlay_lines_carries_forward_sparse_temperature() {
+        let mut with_temp = sample(0.0, 1.0);
+        with_temp.temp_c = Some(18.0);
+        let samples = vec![with_temp, sample(10.0, 2.0), sample(20.0, 3.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+
+        let lines = build_overlay_lines(&[Field::Temp], &samples, &times, 20.0);
+        assert_eq!(lines, vec!["Temp: 18.0 C".to_string()]);
     }
 
     #[test]
