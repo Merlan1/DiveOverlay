@@ -14,6 +14,9 @@ use dive_overlay_core::overlay::{build_overlay_lines, draw_depth_graph, draw_ove
 use dive_overlay_core::pipeline::{extract_frame_at, process_clip, Codec, ProcessingOptions};
 use dive_overlay_core::ClipJob;
 
+mod update_check;
+use update_check::UpdateStatus;
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]),
@@ -22,7 +25,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Tauchdaten Overlay",
         options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(|cc| {
+            let mut app = App::default();
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.update_rx = Some(rx);
+            update_check::spawn_check(tx, cc.egui_ctx.clone());
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -121,6 +130,8 @@ struct App {
     worker_handle: Option<JoinHandle<()>>,
     dialog: Option<ClipDialogState>,
     preview: Option<PreviewState>,
+    update_rx: Option<Receiver<UpdateStatus>>,
+    update_available: Option<(String, String)>,
 }
 
 impl Default for App {
@@ -142,6 +153,8 @@ impl Default for App {
             worker_handle: None,
             dialog: None,
             preview: None,
+            update_rx: None,
+            update_available: None,
         }
     }
 }
@@ -150,8 +163,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_worker(&ctx);
+        self.poll_update_check();
 
         egui::Panel::top("general").show(ui, |ui| {
+            self.ui_update_banner(ui);
             self.ui_general(ui);
         });
         egui::Panel::bottom("execution").show(ui, |ui| {
@@ -200,6 +215,30 @@ impl App {
             }
             ctx.request_repaint();
         }
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(rx) = &self.update_rx else { return };
+        let Ok(status) = rx.try_recv() else { return };
+        self.update_rx = None;
+        match status {
+            UpdateStatus::Available { version, url } => {
+                self.update_available = Some((version, url));
+            }
+            UpdateStatus::UpToDate => {}
+            UpdateStatus::Error(e) => {
+                self.log_lines.push(format!("Update-Prüfung fehlgeschlagen: {e}"));
+            }
+        }
+    }
+
+    fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
+        let Some((version, url)) = &self.update_available else { return };
+        ui.horizontal(|ui| {
+            ui.colored_label(egui::Color32::YELLOW, format!("Neue Version verfügbar: {version}"));
+            ui.hyperlink_to("Download", url);
+        });
+        ui.separator();
     }
 
     fn ui_general(&mut self, ui: &mut egui::Ui) {

@@ -14,3 +14,5 @@ eframe = "0.35.0"
 egui = "0.35.0"
 egui_extras = { version = "0.35.0", features = ["image"] }
 rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
+ureq = { version = "2.12.1", features = ["json"] }
