@@ -150,7 +150,7 @@ impl Default for App {
             fields: "time,depth,temp,pressure,hr".to_string(),
             codec: "auto".to_string(),
             preset: "veryfast".to_string(),
-            hw_accel: false,
+            hw_accel: true,
             column_map: String::new(),
             show_graph: false,
             mode: OutputMode::Overlay,
