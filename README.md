@@ -40,7 +40,7 @@ Binaries landen in `target/release/dive_overlay_cli(.exe)` und `target/release/d
 cargo test --workspace
 ```
 
-Die Test-Suite deckt CSV-Parsing, Sample-Lookup, Overlay-Zeichnen, Untertitel-Generierung, ffprobe-Parsing sowie die volle ffmpeg-Pipeline ab (Dekodieren/Overlay/Encodieren+Audio-Mux, Untertitel-Remux, Abbruch, Multi-Clip-Auto-Sync). Ein Teil der Tests synthetisiert Testclips per `ffmpeg -f lavfi` und benoetigt daher ein funktionierendes `ffmpeg` im PATH.
+Die Test-Suite deckt CSV-Parsing, Sample-Lookup, Overlay-Zeichnen, Untertitel-Generierung, ffprobe-Parsing sowie die volle ffmpeg-Pipeline ab (Dekodieren/Overlay/Encodieren+Audio-Mux, Untertitel-Remux, Abbruch, Multi-Clip-Auto-Sync). Ein Teil der Tests synthetisiert Testclips per `ffmpeg -f lavfi` und benoetigt daher ein funktionierendes `ffmpeg` im PATH. Ein Test fuer Hardware-Beschleunigung laeuft nur, wenn diese Maschine tatsaechlich einen funktionierenden Hardware-Encoder hat (z. B. Intel Quick Sync) — andernfalls wird er uebersprungen, statt fehlzuschlagen.
 
 ## Erwartetes CSV-Format
 
@@ -64,13 +64,13 @@ In der GUI:
 
 - CSV-Datei auswaehlen
 - Felder setzen (z. B. `time,depth,temp`)
-- Modus waehlen: `Overlay (eingebrannt)` oder `Untertitel (an/aus schaltbar)`
-- Im Overlay-Modus bei Bedarf Codec waehlen (`auto` empfohlen, sonst z. B. `avc1` oder `H264`) und Tiefenprofil aktivieren
+- Modus waehlen: `Overlay (eingebrannt)` oder `Untertitel (an/aus schaltbar)`, daneben Tiefenprofil aktivieren (nur Overlay-Modus)
+- Im Overlay-Modus bei Bedarf Codec waehlen (`auto` empfohlen, sonst z. B. `avc1`, `H264` oder `hevc`), Preset (Geschwindigkeit vs. Kompression) und optional Hardware-Beschleunigung
 - Clips einzeln hinzufuegen (Video, Video-Sync, CSV-Sync, Output)
 - Mit `Sync Vorschau` den Frame an der Sync-Stelle inkl. Overlay kontrollieren
 - In der Vorschau mit `-0.5s` / `+0.5s` (bis `-1 min` / `+1 min`) den Sync feinjustieren
 - Verarbeitung starten
-- Fortschritt wird als Prozentbalken waehrend der Verarbeitung angezeigt, Abbruch jederzeit moeglich
+- Fortschritt wird als Prozentbalken (inkl. fps) waehrend der Verarbeitung angezeigt, darunter erscheint der tatsaechlich genutzte Encoder (Software oder Hardware), Abbruch jederzeit moeglich
 
 ### Einzelner Clip
 
@@ -93,6 +93,18 @@ cargo run --release --bin dive_overlay_cli -- \
   --video-sync-sec 3.2 \
   --csv-sync-mmss 0:10 \
   --mode subtitles
+```
+
+Fuer schnelleres Encodieren (Overlay-Modus) per Hardware-Beschleunigung, mit Fallback auf Software falls keine passende Hardware gefunden wird:
+
+```bash
+cargo run --release --bin dive_overlay_cli -- \
+  --csv dive.csv \
+  --video input.mp4 \
+  --video-sync-sec 3.2 \
+  --csv-sync-mmss 0:10 \
+  --codec hevc \
+  --hw-accel
 ```
 
 ### Mehrere Clips (mit Pausen)
@@ -155,7 +167,9 @@ Beispiel:
 - `--fields time,depth,temp,pressure,hr` : welche Werte eingeblendet werden
 - `--column-map time=TIME,depth=Depth` : manuelle Spaltenzuordnung, falls die Auto-Erkennung daneben liegt
 - `--clip "video|video_sync|csv_sync[|out]"` : mehrfach nutzbar fuer Multi-Clip
-- `--codec auto|avc1|H264|mp4v|XVID|MJPG` : Video-Codec (wird auf den passenden ffmpeg-Encoder abgebildet, `auto`/`H264`/`avc1` -> `libx264`), gilt nur im Overlay-Modus
+- `--codec auto|avc1|H264|hevc|H265|mp4v|XVID|MJPG` : Video-Codec (wird auf den passenden ffmpeg-Encoder abgebildet, `auto`/`H264`/`avc1` -> `libx264`, `hevc`/`H265` -> `libx265`), gilt nur im Overlay-Modus
+- `--preset ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo` : Encoder-Preset fuer H264/H265 (schneller = groessere Datei bei gleicher Qualitaet), Standard `veryfast`; wird fuer andere Codecs ignoriert
+- `--hw-accel` : versucht Hardware-Beschleunigung (aktuell Intel Quick Sync) fuer H264/H265 zu nutzen und faellt automatisch auf Software zurueck, falls keine passende Hardware gefunden wird; die CLI gibt aus, welcher Encoder tatsaechlich verwendet wurde
 - `--show-graph` : zeigt ein kleines Tiefenprofil im Video, gilt nur im Overlay-Modus
 - `--mode overlay|subtitles` : `overlay` (Standard) brennt die Werte in die Pixel ein; `subtitles` schreibt sie stattdessen als weiche, im Player an/aus schaltbare Untertitelspur (Video/Audio werden verlustfrei per `-c copy` kopiert, zusaetzlich entsteht eine `.srt`-Datei neben der Ausgabe). Das Tiefenprofil (`--show-graph`) gibt es in diesem Modus nicht, da Untertitel nur Text darstellen koennen.
 - `--auto-sync`, `--base-clip`, `--base-video-sync-sec`, `--base-csv-datetime` : automatisches Sync (siehe oben)
