@@ -251,7 +251,7 @@ impl App {
     fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
         let Some((version, url)) = &self.update_available else { return };
         ui.horizontal(|ui| {
-            ui.colored_label(egui::Color32::YELLOW, format!("New version available: {version}"));
+            ui.colored_label(egui::Color32::from_rgb(184, 92, 0), format!("New version available: {version}"));
             ui.hyperlink_to("Download", url);
         });
         ui.separator();
