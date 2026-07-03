@@ -17,6 +17,7 @@ use crate::subtitle::build_srt;
 pub enum Codec {
     Auto,
     H264,
+    H265,
     Mpeg4,
     Xvid,
     Mjpeg,
@@ -26,6 +27,7 @@ impl Codec {
     pub fn parse(s: &str) -> Codec {
         match s.trim().to_lowercase().as_str() {
             "avc1" | "h264" => Codec::H264,
+            "hevc" | "h265" | "x265" => Codec::H265,
             "mp4v" => Codec::Mpeg4,
             "xvid" => Codec::Xvid,
             "mjpg" | "mjpeg" => Codec::Mjpeg,
@@ -40,11 +42,221 @@ impl Codec {
     fn ffmpeg_codec_name(self) -> &'static str {
         match self {
             Codec::Auto | Codec::H264 => "libx264",
+            Codec::H265 => "libx265",
             Codec::Mpeg4 => "mpeg4",
             Codec::Xvid => "libxvid",
             Codec::Mjpeg => "mjpeg",
         }
     }
+
+    /// Only libx264/libx265 understand `-preset`; the other encoders (mpeg4,
+    /// xvid, mjpeg) have no such concept, so the flag must be omitted for
+    /// them rather than passed and ignored/rejected by ffmpeg.
+    pub fn supports_preset(self) -> bool {
+        matches!(self, Codec::Auto | Codec::H264 | Codec::H265)
+    }
+}
+
+/// x264/x265 speed-vs-compression presets, passed straight through as
+/// ffmpeg's `-preset` value. Faster presets trade off compression efficiency
+/// (larger output for the same quality) for encoding speed; slower ones do
+/// the opposite. Ignored for codecs where `Codec::supports_preset` is false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preset {
+    UltraFast,
+    SuperFast,
+    VeryFast,
+    Faster,
+    Fast,
+    Medium,
+    Slow,
+    Slower,
+    VerySlow,
+    Placebo,
+}
+
+impl Preset {
+    pub fn parse(s: &str) -> Option<Preset> {
+        match s.trim().to_lowercase().as_str() {
+            "ultrafast" => Some(Preset::UltraFast),
+            "superfast" => Some(Preset::SuperFast),
+            "veryfast" => Some(Preset::VeryFast),
+            "faster" => Some(Preset::Faster),
+            "fast" => Some(Preset::Fast),
+            "medium" => Some(Preset::Medium),
+            "slow" => Some(Preset::Slow),
+            "slower" => Some(Preset::Slower),
+            "veryslow" => Some(Preset::VerySlow),
+            "placebo" => Some(Preset::Placebo),
+            _ => None,
+        }
+    }
+
+    fn ffmpeg_name(self) -> &'static str {
+        match self {
+            Preset::UltraFast => "ultrafast",
+            Preset::SuperFast => "superfast",
+            Preset::VeryFast => "veryfast",
+            Preset::Faster => "faster",
+            Preset::Fast => "fast",
+            Preset::Medium => "medium",
+            Preset::Slow => "slow",
+            Preset::Slower => "slower",
+            Preset::VerySlow => "veryslow",
+            Preset::Placebo => "placebo",
+        }
+    }
+}
+
+impl Default for Preset {
+    fn default() -> Self {
+        Preset::VeryFast
+    }
+}
+
+/// Hardware video encoders that auto-detection can consider, one per GPU
+/// vendor's ffmpeg backend. Compiled-in support for an encoder (i.e. it
+/// showing up in `ffmpeg -encoders`) does not mean the corresponding
+/// hardware/driver is actually present on the running machine -- see
+/// `probe_hw_encoder`.
+///
+/// `Nvenc`/`Amf` are unused for now (see `ENABLED_HW_CANDIDATES`) -- allowed
+/// dead code rather than deleted, since the mapping in
+/// `ffmpeg_encoder_name` below is already correct and ready to enable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum HwEncoder {
+    Qsv,
+    Nvenc,
+    Amf,
+}
+
+impl HwEncoder {
+    fn backend_label(self) -> &'static str {
+        match self {
+            HwEncoder::Qsv => "Intel Quick Sync (QSV)",
+            HwEncoder::Nvenc => "NVIDIA NVENC",
+            HwEncoder::Amf => "AMD AMF",
+        }
+    }
+
+    /// Maps to the concrete ffmpeg encoder name for the requested codec
+    /// family, or `None` if that family has no hardware path (mpeg4/xvid/
+    /// mjpeg never do, regardless of backend).
+    fn ffmpeg_encoder_name(self, codec: Codec) -> Option<&'static str> {
+        match (self, codec) {
+            (HwEncoder::Qsv, Codec::Auto | Codec::H264) => Some("h264_qsv"),
+            (HwEncoder::Qsv, Codec::H265) => Some("hevc_qsv"),
+            (HwEncoder::Nvenc, Codec::Auto | Codec::H264) => Some("h264_nvenc"),
+            (HwEncoder::Nvenc, Codec::H265) => Some("hevc_nvenc"),
+            (HwEncoder::Amf, Codec::Auto | Codec::H264) => Some("h264_amf"),
+            (HwEncoder::Amf, Codec::H265) => Some("hevc_amf"),
+            _ => None,
+        }
+    }
+}
+
+/// Hardware encoders auto-detection will actually probe/try, in priority
+/// order. NVENC and AMF are fully implemented above (name mapping) and
+/// below (`probe_hw_encoder` works identically for all three backends),
+/// but are deliberately left out of this list until verified against real
+/// Nvidia/AMD hardware -- the machine this was developed on only has an
+/// Intel iGPU, so only the QSV path has been exercised end to end. Add
+/// `HwEncoder::Nvenc`/`HwEncoder::Amf` here once confirmed on the
+/// corresponding hardware.
+const ENABLED_HW_CANDIDATES: &[HwEncoder] = &[HwEncoder::Qsv];
+
+/// Describes which concrete ffmpeg video encoder ended up being used for a
+/// job. Silently falling back from a requested hardware encoder to
+/// software (or vice versa) is exactly the kind of thing a user needs
+/// visibility into, so this is surfaced back out through `process_clip`'s
+/// `on_encoder` callback rather than staying an internal implementation
+/// detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncoderInfo {
+    Hardware { backend: &'static str, ffmpeg_name: &'static str },
+    Software { ffmpeg_name: &'static str, preset: Option<&'static str> },
+    Remux,
+}
+
+impl EncoderInfo {
+    pub fn describe(&self) -> String {
+        match self {
+            EncoderInfo::Hardware { backend, ffmpeg_name } => format!("Hardware: {backend} ({ffmpeg_name})"),
+            EncoderInfo::Software { ffmpeg_name, preset: Some(p) } => {
+                format!("Software: {ffmpeg_name} (Preset: {p})")
+            }
+            EncoderInfo::Software { ffmpeg_name, preset: None } => format!("Software: {ffmpeg_name}"),
+            EncoderInfo::Remux => "Kein Re-Encode (Untertitel-Modus)".to_string(),
+        }
+    }
+}
+
+/// Probes whether `encoder_name` actually initializes on this machine by
+/// attempting a trivial fraction-of-a-second encode into ffmpeg's null
+/// muxer. This is the only reliable check: `ffmpeg -encoders` lists every
+/// backend the binary was compiled with, not the ones whose driver/hardware
+/// is actually present, and a missing/mismatched driver fails at encoder
+/// init time rather than at compile time.
+fn probe_hw_encoder(encoder_name: &str, pix_fmt: &str) -> bool {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "nullsrc=size=320x240:rate=5:duration=0.2"])
+        .args(["-frames:v", "1", "-c:v", encoder_name, "-pix_fmt", pix_fmt])
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Resolves the concrete `-c:v` value, pixel format, and any extra encoder
+/// args to use for a job: tries `ENABLED_HW_CANDIDATES` first (if
+/// `hw_accel` was requested and the codec has a hardware path), falling
+/// back to the software codec/preset otherwise. Hardware encoders are given
+/// a fixed quality target (`-global_quality`) rather than left on their
+/// default constant-quantization mode, which otherwise produces much larger
+/// files than the software encoders for comparable quality.
+fn resolve_encoder(
+    codec: Codec,
+    preset: Preset,
+    hw_accel: bool,
+) -> (&'static str, &'static str, Vec<&'static str>, EncoderInfo) {
+    if hw_accel {
+        for hw in ENABLED_HW_CANDIDATES {
+            if let Some(name) = hw.ffmpeg_encoder_name(codec) {
+                if probe_hw_encoder(name, "nv12") {
+                    return (
+                        name,
+                        "nv12",
+                        vec!["-global_quality", "23"],
+                        EncoderInfo::Hardware {
+                            backend: hw.backend_label(),
+                            ffmpeg_name: name,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let name = codec.ffmpeg_codec_name();
+    let preset_name = codec.supports_preset().then(|| preset.ffmpeg_name());
+    let extra_args = match preset_name {
+        Some(p) => vec!["-preset", p],
+        None => Vec::new(),
+    };
+    (
+        name,
+        "yuv420p",
+        extra_args,
+        EncoderInfo::Software {
+            ffmpeg_name: name,
+            preset: preset_name,
+        },
+    )
 }
 
 /// Selects how dive telemetry is attached to the output video. `Overlay`
@@ -72,6 +284,8 @@ impl OutputMode {
 pub struct ProcessingOptions {
     pub fields: Vec<Field>,
     pub codec: Codec,
+    pub preset: Preset,
+    pub hw_accel: bool,
     pub show_graph: bool,
     pub mode: OutputMode,
 }
@@ -117,6 +331,7 @@ fn spawn_decoder(video_path: &Path) -> Result<DecodeProcess, CoreError> {
 struct EncodeProcess {
     child: Child,
     stdin: Option<ChildStdin>,
+    info: EncoderInfo,
 }
 
 /// Spawns an ffmpeg process that reads raw rgb24 frames on stdin, muxes in
@@ -132,6 +347,8 @@ fn spawn_encoder(
     height: u32,
     fps: f64,
     codec: Codec,
+    preset: Preset,
+    hw_accel: bool,
 ) -> Result<EncodeProcess, CoreError> {
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -141,14 +358,18 @@ fn spawn_encoder(
 
     let size_arg = format!("{width}x{height}");
     let fps_arg = format!("{fps}");
+    let (encoder_name, pix_fmt, extra_args, info) = resolve_encoder(codec, preset, hw_accel);
 
-    let mut child = Command::new("ffmpeg")
-        .args(["-y", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-f", "rawvideo", "-pix_fmt", "rgb24"])
         .args(["-s", &size_arg, "-r", &fps_arg, "-i", "pipe:0"])
         .arg("-i")
         .arg(original_input)
         .args(["-map", "0:v:0", "-map", "1:a:0?"])
-        .args(["-c:v", codec.ffmpeg_codec_name(), "-pix_fmt", "yuv420p"])
+        .args(["-c:v", encoder_name])
+        .args(&extra_args);
+    let mut child = cmd
+        .args(["-pix_fmt", pix_fmt])
         .args(["-c:a", "aac", "-b:a", "192k", "-shortest"])
         .arg(output_path)
         .stdin(Stdio::piped())
@@ -166,6 +387,7 @@ fn spawn_encoder(
     Ok(EncodeProcess {
         child,
         stdin: Some(stdin),
+        info,
     })
 }
 
@@ -181,8 +403,10 @@ pub fn process_clip(
     options: &ProcessingOptions,
     stop_flag: &Arc<AtomicBool>,
     mut progress: impl FnMut(u64, u64),
+    mut on_encoder: impl FnMut(&EncoderInfo),
 ) -> Result<bool, CoreError> {
     if options.mode == OutputMode::Subtitles {
+        on_encoder(&EncoderInfo::Remux);
         return process_clip_subtitles(job, samples, times, options, stop_flag, progress);
     }
 
@@ -206,7 +430,10 @@ pub fn process_clip(
         info.height,
         info.fps,
         options.codec,
+        options.preset,
+        options.hw_accel,
     )?;
+    on_encoder(&encoder.info);
 
     let frame_size = info.width as usize * info.height as usize * 3;
     let total_estimate = info.estimated_frames.unwrap_or(0);
@@ -434,6 +661,151 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn codec_parse_recognizes_h265_aliases() {
+        assert_eq!(Codec::parse("hevc"), Codec::H265);
+        assert_eq!(Codec::parse("h265"), Codec::H265);
+        assert_eq!(Codec::parse("x265"), Codec::H265);
+        assert_eq!(Codec::parse("HEVC"), Codec::H265);
+        assert_eq!(Codec::parse(""), Codec::Auto);
+    }
+
+    #[test]
+    fn codec_supports_preset_matches_x26x_only() {
+        assert!(Codec::Auto.supports_preset());
+        assert!(Codec::H264.supports_preset());
+        assert!(Codec::H265.supports_preset());
+        assert!(!Codec::Mpeg4.supports_preset());
+        assert!(!Codec::Xvid.supports_preset());
+        assert!(!Codec::Mjpeg.supports_preset());
+    }
+
+    #[test]
+    fn preset_parse_round_trips_all_known_values() {
+        let names = [
+            "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo",
+        ];
+        for name in names {
+            assert_eq!(Preset::parse(name).unwrap().ffmpeg_name(), name);
+        }
+        assert_eq!(Preset::parse("bogus"), None);
+    }
+
+    #[test]
+    fn probe_hw_encoder_rejects_bogus_encoder_name() {
+        assert!(!probe_hw_encoder("definitely_not_a_real_encoder", "nv12"));
+    }
+
+    #[test]
+    fn resolve_encoder_uses_software_when_hw_accel_disabled() {
+        let (name, pix_fmt, args, info) = resolve_encoder(Codec::H264, Preset::Fast, false);
+        assert_eq!(name, "libx264");
+        assert_eq!(pix_fmt, "yuv420p");
+        assert_eq!(args, vec!["-preset", "fast"]);
+        assert!(matches!(
+            info,
+            EncoderInfo::Software {
+                ffmpeg_name: "libx264",
+                preset: Some("fast")
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_encoder_ignores_hw_accel_for_codecs_without_a_hardware_path() {
+        // mpeg4/xvid/mjpeg have no hardware encoder in any backend, so
+        // hw_accel=true must still resolve to the software encoder.
+        let (name, pix_fmt, args, info) = resolve_encoder(Codec::Mpeg4, Preset::VeryFast, true);
+        assert_eq!(name, "mpeg4");
+        assert_eq!(pix_fmt, "yuv420p");
+        assert!(args.is_empty());
+        assert!(matches!(
+            info,
+            EncoderInfo::Software {
+                ffmpeg_name: "mpeg4",
+                preset: None
+            }
+        ));
+    }
+
+    #[test]
+    fn encoder_info_describe_covers_all_variants() {
+        assert_eq!(
+            EncoderInfo::Hardware {
+                backend: "Intel Quick Sync (QSV)",
+                ffmpeg_name: "h264_qsv"
+            }
+            .describe(),
+            "Hardware: Intel Quick Sync (QSV) (h264_qsv)"
+        );
+        assert_eq!(
+            EncoderInfo::Software {
+                ffmpeg_name: "libx264",
+                preset: Some("veryfast")
+            }
+            .describe(),
+            "Software: libx264 (Preset: veryfast)"
+        );
+        assert_eq!(
+            EncoderInfo::Software {
+                ffmpeg_name: "mpeg4",
+                preset: None
+            }
+            .describe(),
+            "Software: mpeg4"
+        );
+        assert_eq!(EncoderInfo::Remux.describe(), "Kein Re-Encode (Untertitel-Modus)");
+    }
+
+    /// Opportunistic: exercises the real hardware-acceleration path when
+    /// this machine has a working hardware encoder (verified separately to
+    /// have Intel Quick Sync during development), and degrades to a no-op
+    /// elsewhere (e.g. CI runners without QSV/NVENC/AMF) rather than
+    /// failing on hardware this crate cannot assume is present.
+    #[test]
+    fn processes_synthetic_clip_with_hw_accel_when_available() {
+        if !ENABLED_HW_CANDIDATES
+            .iter()
+            .any(|hw| hw.ffmpeg_encoder_name(Codec::Auto).is_some_and(|name| probe_hw_encoder(name, "nv12")))
+        {
+            eprintln!("skipping processes_synthetic_clip_with_hw_accel_when_available: no working hw encoder here");
+            return;
+        }
+
+        let dir = make_test_dir("hw_accel");
+        let clip = synth_clip(&dir, "input.mp4", 2, 5);
+        let output = dir.join("output.mp4");
+
+        let job = ClipJob {
+            video_path: clip,
+            output_path: output.clone(),
+            video_sync_sec: 0.0,
+            csv_sync_sec: 0.0,
+            video_start_utc: None,
+        };
+        let samples = vec![sample(0.0, 1.0), sample(1.0, 5.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let options = ProcessingOptions {
+            fields: vec![Field::Depth],
+            codec: Codec::Auto,
+            preset: Preset::VeryFast,
+            hw_accel: true,
+            show_graph: false,
+            mode: OutputMode::Overlay,
+        };
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let mut encoder_info = None;
+        let completed = process_clip(&job, &samples, &times, &options, &stop_flag, |_, _| {}, |info| {
+            encoder_info = Some(info.clone());
+        })
+        .unwrap();
+
+        assert!(completed);
+        assert!(output.exists());
+        assert!(matches!(encoder_info, Some(EncoderInfo::Hardware { .. })));
+    }
+
     fn synth_clip(dir: &Path, name: &str, duration_secs: u32, fps: u32) -> PathBuf {
         let path = dir.join(name);
         let video_src = format!("testsrc=size=160x120:rate={fps}:duration={duration_secs}");
@@ -476,16 +848,28 @@ mod tests {
         let options = ProcessingOptions {
             fields: vec![Field::Time, Field::Depth, Field::Temp],
             codec: Codec::Auto,
+            preset: Preset::VeryFast,
+            hw_accel: false,
             show_graph: true,
             mode: OutputMode::Overlay,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
         let mut progress_calls = Vec::new();
-        let completed = process_clip(&job, &samples, &times, &options, &stop_flag, |done, total| {
-            progress_calls.push((done, total));
-        })
+        let mut encoder_info = None;
+        let completed = process_clip(
+            &job,
+            &samples,
+            &times,
+            &options,
+            &stop_flag,
+            |done, total| {
+                progress_calls.push((done, total));
+            },
+            |info| encoder_info = Some(info.clone()),
+        )
         .unwrap();
+        assert!(matches!(encoder_info, Some(EncoderInfo::Software { ffmpeg_name: "libx264", .. })));
 
         assert!(completed);
         assert!(output.exists());
@@ -523,21 +907,70 @@ mod tests {
         let options = ProcessingOptions {
             fields: vec![Field::Depth],
             codec: Codec::Auto,
+            preset: Preset::VeryFast,
+            hw_accel: false,
             show_graph: false,
             mode: OutputMode::Overlay,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_for_progress = stop_flag.clone();
 
-        let completed = process_clip(&job, &samples, &times, &options, &stop_flag, move |done, _total| {
-            if done >= 5 {
-                stop_flag_for_progress.store(true, Ordering::Relaxed);
-            }
-        })
+        let completed = process_clip(
+            &job,
+            &samples,
+            &times,
+            &options,
+            &stop_flag,
+            move |done, _total| {
+                if done >= 5 {
+                    stop_flag_for_progress.store(true, Ordering::Relaxed);
+                }
+            },
+            |_| {},
+        )
         .unwrap();
 
         assert!(!completed);
         assert!(output.exists());
+    }
+
+    #[test]
+    fn processes_synthetic_clip_with_h265_and_ultrafast_preset() {
+        let dir = make_test_dir("h265");
+        let clip = synth_clip(&dir, "input.mp4", 2, 5);
+        let output = dir.join("output.mp4");
+
+        let job = ClipJob {
+            video_path: clip,
+            output_path: output.clone(),
+            video_sync_sec: 0.0,
+            csv_sync_sec: 0.0,
+            video_start_utc: None,
+        };
+        let samples = vec![sample(0.0, 1.0), sample(1.0, 5.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let options = ProcessingOptions {
+            fields: vec![Field::Depth],
+            codec: Codec::H265,
+            preset: Preset::UltraFast,
+            hw_accel: false,
+            show_graph: false,
+            mode: OutputMode::Overlay,
+        };
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let completed = process_clip(&job, &samples, &times, &options, &stop_flag, |_, _| {}, |_| {}).unwrap();
+        assert!(completed);
+        assert!(output.exists());
+
+        let ffprobe_out = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v", "-show_entries", "stream=codec_name"])
+            .args(["-of", "csv=p=0"])
+            .arg(&output)
+            .output()
+            .unwrap();
+        let codec_name = String::from_utf8_lossy(&ffprobe_out.stdout);
+        assert!(codec_name.trim().contains("hevc"), "expected hevc codec, got: {codec_name}");
     }
 
     #[test]
@@ -558,12 +991,14 @@ mod tests {
         let options = ProcessingOptions {
             fields: vec![Field::Time, Field::Depth],
             codec: Codec::Auto,
+            preset: Preset::VeryFast,
+            hw_accel: false,
             show_graph: false,
             mode: OutputMode::Subtitles,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let completed = process_clip(&job, &samples, &times, &options, &stop_flag, |_, _| {}).unwrap();
+        let completed = process_clip(&job, &samples, &times, &options, &stop_flag, |_, _| {}, |_| {}).unwrap();
 
         assert!(completed);
         assert!(output.exists());

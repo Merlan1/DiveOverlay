@@ -1,13 +1,15 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
 use dive_overlay_core::csv_data::{load_samples, parse_column_map, parse_duration_to_seconds, parse_fields};
 use dive_overlay_core::ffprobe::ensure_ffmpeg_available;
-use dive_overlay_core::pipeline::{process_clip, Codec, OutputMode, ProcessingOptions};
+use dive_overlay_core::pipeline::{process_clip, Codec, OutputMode, Preset, ProcessingOptions};
 use dive_overlay_core::sync::{compute_auto_sync, derive_output_path, parse_clip_spec, AutoSyncParams};
 use dive_overlay_core::ClipJob;
 
@@ -43,9 +45,22 @@ struct Args {
     #[arg(long, default_value = "")]
     column_map: String,
 
-    /// Video-Codec: auto, avc1, H264, mp4v, XVID, MJPG
+    /// Video-Codec: auto, avc1, H264, hevc/H265, mp4v, XVID, MJPG
     #[arg(long, default_value = "auto")]
     codec: String,
+
+    /// Encoder-Preset fuer H264/H265 (Geschwindigkeit vs. Kompression):
+    /// ultrafast, superfast, veryfast, faster, fast, medium, slow, slower,
+    /// veryslow, placebo. Wird fuer andere Codecs ignoriert.
+    #[arg(long, default_value = "veryfast")]
+    preset: String,
+
+    /// Versucht Hardware-Beschleunigung (z. B. Intel Quick Sync) fuer
+    /// H264/H265 zu nutzen; faellt automatisch auf Software zurueck, falls
+    /// keine passende Hardware gefunden wird. Wird fuer andere Codecs
+    /// ignoriert.
+    #[arg(long)]
+    hw_accel: bool,
 
     /// Zeigt kleines Tiefenprofil (Graph) an
     #[arg(long)]
@@ -142,10 +157,18 @@ fn main() -> Result<()> {
 
     let mode = OutputMode::parse(&args.mode)
         .ok_or_else(|| anyhow!("Ungültiger --mode Wert: {} (erwartet: overlay, subtitles)", args.mode))?;
+    let preset = Preset::parse(&args.preset).ok_or_else(|| {
+        anyhow!(
+            "Ungültiger --preset Wert: {} (erwartet: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo)",
+            args.preset
+        )
+    })?;
 
     let options = ProcessingOptions {
         fields,
         codec: Codec::parse(&args.codec),
+        preset,
+        hw_accel: args.hw_accel,
         show_graph: args.show_graph,
         mode,
     };
@@ -154,8 +177,50 @@ fn main() -> Result<()> {
     let total = jobs.len();
     for (i, job) in jobs.iter_mut().enumerate() {
         job.output_path = job.output_path.with_extension("mp4");
-        process_clip(job, &samples, &times, &options, &stop_flag, |_, _| {})
-            .with_context(|| format!("Verarbeitung fehlgeschlagen: {}", job.video_path.display()))?;
+
+        let mut last_instant = Instant::now();
+        let mut last_done: u64 = 0;
+        let mut printed_progress = false;
+
+        process_clip(
+            job,
+            &samples,
+            &times,
+            &options,
+            &stop_flag,
+            |done, total_frames| {
+                // The final progress call happens after the encoder has been
+                // awaited (mp4 finalization/moov write), so its elapsed time
+                // includes that wait, not just frame processing -- computing an
+                // fps from it would read as a bogus last-moment slowdown.
+                if total_frames > 0 && done >= total_frames {
+                    print!("\r[{}/{}] Frame {}/{} (fertig)   ", i + 1, total, done, total_frames);
+                    let _ = std::io::stdout().flush();
+                    printed_progress = true;
+                    return;
+                }
+
+                let elapsed = last_instant.elapsed().as_secs_f64();
+                if elapsed >= 0.1 {
+                    let fps = done.saturating_sub(last_done) as f64 / elapsed;
+                    if total_frames > 0 {
+                        print!("\r[{}/{}] Frame {}/{} ({:.1} fps)   ", i + 1, total, done, total_frames, fps);
+                    } else {
+                        print!("\r[{}/{}] Frame {} ({:.1} fps)   ", i + 1, total, done, fps);
+                    }
+                    let _ = std::io::stdout().flush();
+                    printed_progress = true;
+                    last_instant = Instant::now();
+                    last_done = done;
+                }
+            },
+            |info| println!("[{}/{}] Encoder: {}", i + 1, total, info.describe()),
+        )
+        .with_context(|| format!("Verarbeitung fehlgeschlagen: {}", job.video_path.display()))?;
+
+        if printed_progress {
+            println!();
+        }
         println!("[{}/{}] Fertig: {}", i + 1, total, job.output_path.display());
     }
 

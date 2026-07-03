@@ -11,7 +11,9 @@ use dive_overlay_core::csv_data::{
 use dive_overlay_core::ffprobe::probe_video;
 use dive_overlay_core::model::Field;
 use dive_overlay_core::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay, OverlayCache};
-use dive_overlay_core::pipeline::{extract_frame_at, process_clip, Codec, OutputMode, ProcessingOptions};
+use dive_overlay_core::pipeline::{
+    extract_frame_at, process_clip, Codec, EncoderInfo, OutputMode, Preset, ProcessingOptions,
+};
 use dive_overlay_core::ClipJob;
 
 mod update_check;
@@ -46,6 +48,8 @@ struct ClipEntry {
 enum WorkerEvent {
     Log(String),
     Progress(f32),
+    Fps(f64),
+    Encoder(String),
     Done(Result<(), String>),
 }
 
@@ -117,6 +121,8 @@ struct App {
     csv_path: String,
     fields: String,
     codec: String,
+    preset: String,
+    hw_accel: bool,
     column_map: String,
     show_graph: bool,
     mode: OutputMode,
@@ -124,6 +130,8 @@ struct App {
     selected: Option<usize>,
     status: String,
     progress: f32,
+    fps: f64,
+    encoder_info: String,
     log_lines: Vec<String>,
     running: bool,
     cancel_flag: Arc<AtomicBool>,
@@ -141,6 +149,8 @@ impl Default for App {
             csv_path: String::new(),
             fields: "time,depth,temp,pressure,hr".to_string(),
             codec: "auto".to_string(),
+            preset: "veryfast".to_string(),
+            hw_accel: false,
             column_map: String::new(),
             show_graph: false,
             mode: OutputMode::Overlay,
@@ -148,6 +158,8 @@ impl Default for App {
             selected: None,
             status: "Bereit".to_string(),
             progress: 0.0,
+            fps: 0.0,
+            encoder_info: String::new(),
             log_lines: Vec::new(),
             running: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -195,6 +207,8 @@ impl App {
                 match event {
                     WorkerEvent::Log(line) => self.log_lines.push(line),
                     WorkerEvent::Progress(p) => self.progress = p,
+                    WorkerEvent::Fps(f) => self.fps = f,
+                    WorkerEvent::Encoder(desc) => self.encoder_info = desc,
                     WorkerEvent::Done(result) => done = Some(result),
                 }
             }
@@ -273,6 +287,10 @@ impl App {
                     ui.selectable_value(&mut self.mode, OutputMode::Overlay, "Overlay (eingebrannt)");
                     ui.selectable_value(&mut self.mode, OutputMode::Subtitles, "Untertitel (an/aus schaltbar)");
                 });
+
+            ui.add_enabled_ui(self.mode == OutputMode::Overlay, |ui| {
+                ui.checkbox(&mut self.show_graph, "Tiefenprofil anzeigen");
+            });
         });
         let subtitle_mode = self.mode == OutputMode::Subtitles;
         ui.horizontal(|ui| {
@@ -281,15 +299,40 @@ impl App {
                 egui::ComboBox::from_id_salt("codec")
                     .selected_text(self.codec.clone())
                     .show_ui(ui, |ui| {
-                        for opt in ["auto", "avc1", "H264", "mp4v", "XVID", "MJPG"] {
+                        for opt in ["auto", "avc1", "H264", "hevc", "mp4v", "XVID", "MJPG"] {
                             ui.selectable_value(&mut self.codec, opt.to_string(), opt);
                         }
                     });
-                ui.checkbox(&mut self.show_graph, "Tiefenprofil anzeigen");
+
+                let hw_applies = Codec::parse(&self.codec).supports_preset();
+                ui.add_enabled_ui(hw_applies, |ui| {
+                    ui.label("Preset:");
+                    egui::ComboBox::from_id_salt("preset")
+                        .selected_text(self.preset.clone())
+                        .show_ui(ui, |ui| {
+                            for opt in [
+                                "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower",
+                                "veryslow", "placebo",
+                            ] {
+                                ui.selectable_value(&mut self.preset, opt.to_string(), opt);
+                            }
+                        });
+                });
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!subtitle_mode, |ui| {
+                let hw_applies = Codec::parse(&self.codec).supports_preset();
+                ui.add_enabled_ui(hw_applies, |ui| {
+                    ui.checkbox(&mut self.hw_accel, "Hardware-Beschleunigung (falls verfügbar)");
+                });
             });
         });
         if subtitle_mode {
             ui.label("Hinweis: Untertitel-Modus kopiert Video/Audio verlustfrei und schreibt zusätzlich eine .srt Datei neben der Ausgabe.");
+        }
+        if !self.encoder_info.is_empty() {
+            ui.label(format!("Encoder: {}", self.encoder_info));
         }
     }
 
@@ -597,7 +640,12 @@ impl App {
             ui.label(&self.status);
         });
 
-        ui.add(egui::ProgressBar::new(self.progress / 100.0).text(format!("{}%", self.progress as i32)));
+        let bar_text = if self.running && self.fps > 0.0 {
+            format!("{}% ({:.1} fps)", self.progress as i32, self.fps)
+        } else {
+            format!("{}%", self.progress as i32)
+        };
+        ui.add(egui::ProgressBar::new(self.progress / 100.0).text(bar_text));
 
         egui::ScrollArea::vertical().max_height(150.0).stick_to_bottom(true).show(ui, |ui| {
             for line in &self.log_lines {
@@ -649,6 +697,8 @@ impl App {
         }
 
         let codec = Codec::parse(&self.codec);
+        let preset = Preset::parse(&self.preset).unwrap_or_default();
+        let hw_accel = self.hw_accel;
         let show_graph = self.show_graph;
         let mode = self.mode;
         let entries = self.entries.clone();
@@ -661,6 +711,8 @@ impl App {
         self.running = true;
         self.status = "Verarbeite...".to_string();
         self.progress = 0.0;
+        self.fps = 0.0;
+        self.encoder_info = String::new();
         self.log_lines.push("Starte Verarbeitung...".to_string());
 
         let worker_ctx = ctx.clone();
@@ -671,6 +723,8 @@ impl App {
                 column_map,
                 entries,
                 codec,
+                preset,
+                hw_accel,
                 show_graph,
                 mode,
                 &cancel_flag,
@@ -691,6 +745,8 @@ fn run_worker(
     column_map: HashMap<String, String>,
     entries: Vec<ClipEntry>,
     codec: Codec,
+    preset: Preset,
+    hw_accel: bool,
     show_graph: bool,
     mode: OutputMode,
     cancel_flag: &Arc<AtomicBool>,
@@ -740,20 +796,49 @@ fn run_worker(
         let options = ProcessingOptions {
             fields: fields.clone(),
             codec,
+            preset,
+            hw_accel,
             show_graph,
             mode,
         };
 
         let tx_progress = tx.clone();
         let ctx_progress = ctx.clone();
-        let completed = process_clip(&job, &samples, &times, &options, cancel_flag, move |done, total_reported| {
-            let effective_total = if total_reported > 0 { total_reported } else { clip_total };
-            let effective_done = done.min(effective_total);
-            let global_done = base_done_frames + effective_done;
-            let percent = (global_done as f64 * 100.0 / total_frames_all as f64) as f32;
-            let _ = tx_progress.send(WorkerEvent::Progress(percent));
-            ctx_progress.request_repaint();
-        })
+        let tx_encoder = tx.clone();
+        let mut last_instant = std::time::Instant::now();
+        let mut last_done: u64 = 0;
+        let completed = process_clip(
+            &job,
+            &samples,
+            &times,
+            &options,
+            cancel_flag,
+            move |done, total_reported| {
+                let effective_total = if total_reported > 0 { total_reported } else { clip_total };
+                let effective_done = done.min(effective_total);
+                let global_done = base_done_frames + effective_done;
+                let percent = (global_done as f64 * 100.0 / total_frames_all as f64) as f32;
+                let _ = tx_progress.send(WorkerEvent::Progress(percent));
+
+                // Skip the final call: it fires after the encoder has been
+                // awaited (mp4 finalization), so its elapsed time includes that
+                // wait rather than just frame processing, which would read as a
+                // bogus last-moment slowdown.
+                let is_final_call = total_reported > 0 && done >= total_reported;
+                let elapsed = last_instant.elapsed().as_secs_f64();
+                if !is_final_call && elapsed >= 0.1 {
+                    let fps = done.saturating_sub(last_done) as f64 / elapsed;
+                    let _ = tx_progress.send(WorkerEvent::Fps(fps));
+                    last_instant = std::time::Instant::now();
+                    last_done = done;
+                }
+
+                ctx_progress.request_repaint();
+            },
+            move |info: &EncoderInfo| {
+                let _ = tx_encoder.send(WorkerEvent::Encoder(info.describe()));
+            },
+        )
         .map_err(|e| e.to_string())?;
 
         if !completed {
@@ -832,6 +917,8 @@ mod tests {
             HashMap::new(),
             vec![entry],
             Codec::Auto,
+            Preset::VeryFast,
+            false,
             false,
             OutputMode::Overlay,
             &cancel_flag,
@@ -880,6 +967,8 @@ mod tests {
             HashMap::new(),
             vec![entry],
             Codec::Auto,
+            Preset::VeryFast,
+            false,
             false,
             OutputMode::Overlay,
             &cancel_flag,
