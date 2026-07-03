@@ -10,7 +10,7 @@ use dive_overlay_core::csv_data::{
 };
 use dive_overlay_core::ffprobe::probe_video;
 use dive_overlay_core::model::Field;
-use dive_overlay_core::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay};
+use dive_overlay_core::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay, OverlayCache};
 use dive_overlay_core::pipeline::{extract_frame_at, process_clip, Codec, OutputMode, ProcessingOptions};
 use dive_overlay_core::ClipJob;
 
@@ -563,7 +563,7 @@ impl App {
 
         let mut frame = extract_frame_at(&entry.video_path, entry.video_sync_sec)?;
         let lines = build_overlay_lines(&fields, &samples, &times, csv_sync_sec);
-        draw_overlay(&mut frame, &lines);
+        draw_overlay(&mut frame, &lines, &mut OverlayCache::new());
         if self.show_graph {
             draw_depth_graph(&mut frame, &samples, &times, csv_sync_sec, 600.0);
         }

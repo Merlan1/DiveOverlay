@@ -10,7 +10,7 @@ use image::RgbImage;
 use crate::error::CoreError;
 use crate::ffprobe::probe_video;
 use crate::model::{ClipJob, DiveSample, Field};
-use crate::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay};
+use crate::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay, OverlayCache};
 use crate::subtitle::build_srt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +214,7 @@ pub fn process_clip(
     let mut buf = vec![0u8; frame_size];
     let mut frame_idx: u64 = 0;
     let mut cancelled = false;
+    let mut overlay_cache = OverlayCache::new();
     progress(0, total_estimate);
 
     loop {
@@ -235,7 +236,7 @@ pub fn process_clip(
         let dive_sec = job.csv_sync_sec + (video_sec - job.video_sync_sec);
 
         let lines = build_overlay_lines(&options.fields, samples, times, dive_sec);
-        draw_overlay(&mut img, &lines);
+        draw_overlay(&mut img, &lines, &mut overlay_cache);
         if options.show_graph {
             draw_depth_graph(&mut img, samples, times, dive_sec, 600.0);
         }

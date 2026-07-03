@@ -1,5 +1,7 @@
+use std::sync::OnceLock;
+
 use ab_glyph::{FontRef, PxScale};
-use image::{Rgb, RgbImage};
+use image::{Rgb, RgbImage, Rgba, RgbaImage};
 use imageproc::drawing::{draw_hollow_rect_mut, draw_line_segment_mut, draw_text_mut, text_size};
 use imageproc::rect::Rect;
 
@@ -9,8 +11,13 @@ use crate::model::{value_for_field, DiveSample, Field};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 
-pub fn font() -> FontRef<'static> {
-    FontRef::try_from_slice(FONT_BYTES).expect("bundled DejaVuSans.ttf must be a valid font")
+static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
+
+/// Parses the bundled font once and caches it -- `draw_overlay`/`draw_depth_graph`
+/// call this every frame, and re-parsing the same static bytes on every call
+/// was pure repeated work.
+pub fn font() -> &'static FontRef<'static> {
+    FONT.get_or_init(|| FontRef::try_from_slice(FONT_BYTES).expect("bundled DejaVuSans.ttf must be a valid font"))
 }
 
 /// Alpha-blends a solid color into a rectangular region of `img`, clipped to
@@ -73,29 +80,110 @@ fn last_known_value(samples_up_to_now: &[DiveSample], field: Field) -> Option<St
         .find_map(|sample| value_for_field(sample, field))
 }
 
-pub fn draw_overlay(img: &mut RgbImage, lines: &[String]) {
-    let (w, h) = img.dimensions();
-    let x = (w as f64 * 0.04) as i32;
-    let y = (h as f64 * 0.06) as i32;
-    let line_height = ((h as f64 * 0.045) as i32).max(24);
+/// Caches the rendered info-box tile (translucent background + text) across
+/// frames, keyed on the exact lines shown. Given 1-10s dive-computer logging
+/// intervals, the same lines are typically shown for many consecutive
+/// frames, so re-rendering only on an actual content change turns most
+/// frames' overlay cost into a cheap alpha-composite instead of glyph
+/// rasterization.
+#[derive(Default)]
+pub struct OverlayCache {
+    tile: Option<CachedTile>,
+}
+
+struct CachedTile {
+    lines: Vec<String>,
+    x: i32,
+    y: i32,
+    image: RgbaImage,
+}
+
+impl OverlayCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Renders `lines` into a standalone RGBA tile: a translucent background
+/// (alpha baked in, matching the 0.45 opacity `blend_rect_alpha` used to
+/// apply directly) with opaque text drawn on top. The tile carries its own
+/// alpha channel so it can be composited onto any frame later without
+/// redoing font/text work.
+fn render_tile(lines: &[String], x: i32, y: i32, line_height: i32) -> CachedTile {
     let padding: i32 = 14;
     let scale = PxScale::from(22.0);
     let font = font();
 
     let box_w = lines
         .iter()
-        .map(|line| text_size(scale, &font, line).0 as i32)
+        .map(|line| text_size(scale, font, line).0 as i32)
         .max()
         .unwrap_or(0)
         + padding * 2;
     let box_h = line_height * lines.len() as i32 + padding;
 
-    blend_rect_alpha(img, x, y, box_w.max(0) as u32, box_h.max(0) as u32, Rgb([20, 20, 20]), 0.45);
+    let bg_alpha = (0.45_f32 * 255.0).round() as u8;
+    let mut tile = RgbaImage::from_pixel(box_w.max(1) as u32, box_h.max(1) as u32, Rgba([20, 20, 20, bg_alpha]));
 
-    let mut text_y = y + padding / 2;
+    let mut text_y = padding / 2;
     for line in lines {
-        draw_text_mut(img, Rgb([230, 245, 255]), x + padding, text_y, scale, &font, line);
+        draw_text_mut(&mut tile, Rgba([230, 245, 255, 255]), padding, text_y, scale, font, line);
         text_y += line_height;
+    }
+
+    CachedTile {
+        lines: lines.to_vec(),
+        x,
+        y,
+        image: tile,
+    }
+}
+
+/// Alpha-composites `tile` (its own per-pixel alpha) onto `img` at `(x, y)`,
+/// clipped to image bounds -- the per-frame counterpart to `render_tile`,
+/// doing only the blend math with no font/text work.
+fn composite_tile(img: &mut RgbImage, tile: &RgbaImage, x: i32, y: i32) {
+    let (img_w, img_h) = img.dimensions();
+    let (tile_w, tile_h) = tile.dimensions();
+    let x0 = x.max(0) as u32;
+    let y0 = y.max(0) as u32;
+    let x1 = (x.saturating_add(tile_w as i32).max(0) as u32).min(img_w);
+    let y1 = (y.saturating_add(tile_h as i32).max(0) as u32).min(img_h);
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let tile_px = tile.get_pixel((px as i32 - x) as u32, (py as i32 - y) as u32).0;
+            let alpha = tile_px[3] as f32 / 255.0;
+            if alpha <= 0.0 {
+                continue;
+            }
+            let orig = img.get_pixel(px, py).0;
+            let mut blended = [0u8; 3];
+            for c in 0..3 {
+                let v = alpha * tile_px[c] as f32 + (1.0 - alpha) * orig[c] as f32;
+                blended[c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            img.put_pixel(px, py, Rgb(blended));
+        }
+    }
+}
+
+pub fn draw_overlay(img: &mut RgbImage, lines: &[String], cache: &mut OverlayCache) {
+    let (w, h) = img.dimensions();
+    let x = (w as f64 * 0.04) as i32;
+    let y = (h as f64 * 0.06) as i32;
+    let line_height = ((h as f64 * 0.045) as i32).max(24);
+
+    let needs_render = match &cache.tile {
+        Some(cached) => cached.x != x || cached.y != y || cached.lines.as_slice() != lines,
+        None => true,
+    };
+    if needs_render {
+        cache.tile = Some(render_tile(lines, x, y, line_height));
+    }
+
+    if let Some(cached) = &cache.tile {
+        composite_tile(img, &cached.image, cached.x, cached.y);
     }
 }
 
@@ -158,16 +246,16 @@ pub fn draw_depth_graph(img: &mut RgbImage, samples: &[DiveSample], times: &[f64
     let axis_font = font();
     let max_label = format!("{max_depth:.1}m");
     let min_label = format!("{min_depth:.1}m");
-    let (_, min_label_h) = text_size(axis_scale, &axis_font, &min_label);
+    let (_, min_label_h) = text_size(axis_scale, axis_font, &min_label);
     // min_depth (shallowest) plots at the top of the box, max_depth (deepest) at the bottom.
-    draw_text_mut(img, Rgb([200, 200, 200]), x + 4, y + 2, axis_scale, &axis_font, &min_label);
+    draw_text_mut(img, Rgb([200, 200, 200]), x + 4, y + 2, axis_scale, axis_font, &min_label);
     draw_text_mut(
         img,
         Rgb([200, 200, 200]),
         x + 4,
         y + graph_h as i32 - min_label_h as i32 - 2,
         axis_scale,
-        &axis_font,
+        axis_font,
         &max_label,
     );
 }
@@ -215,7 +303,25 @@ mod tests {
     #[test]
     fn draw_overlay_does_not_panic_on_small_image() {
         let mut img = RgbImage::new(320, 240);
-        draw_overlay(&mut img, &["Tauchzeit: 00:10".to_string()]);
+        let mut cache = OverlayCache::new();
+        draw_overlay(&mut img, &["Tauchzeit: 00:10".to_string()], &mut cache);
+    }
+
+    #[test]
+    fn draw_overlay_reuses_cached_tile_for_identical_lines_and_rerenders_on_change() {
+        let mut img = RgbImage::new(320, 240);
+        let mut cache = OverlayCache::new();
+        let lines = vec!["Tauchzeit: 00:10".to_string(), "Tiefe: 1.5 m".to_string()];
+
+        draw_overlay(&mut img, &lines, &mut cache);
+        let tile_ptr_before = cache.tile.as_ref().unwrap().image.as_raw().as_ptr();
+        draw_overlay(&mut img, &lines, &mut cache);
+        let tile_ptr_after = cache.tile.as_ref().unwrap().image.as_raw().as_ptr();
+        assert_eq!(tile_ptr_before, tile_ptr_after, "unchanged lines must reuse the cached tile");
+
+        let other_lines = vec!["Tauchzeit: 00:20".to_string(), "Tiefe: 2.0 m".to_string()];
+        draw_overlay(&mut img, &other_lines, &mut cache);
+        assert_eq!(cache.tile.as_ref().unwrap().lines, other_lines);
     }
 
     #[test]
