@@ -80,7 +80,7 @@ mod tests {
         assert_eq!(srt.matches(" --> ").count(), 3);
         assert!(srt.starts_with("1\n00:00:00,000 --> 00:00:01,000\n"));
         assert!(srt.contains("00:00:02,000 --> 00:00:02,500\n"));
-        assert!(srt.contains("Tiefe: 2.0 m"));
+        assert!(srt.contains("Depth: 2.0 m"));
     }
 
     #[test]
@@ -89,9 +89,9 @@ mod tests {
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
 
         // video-second 0 corresponds to csv_sync_sec=10, so the single cue
-        // should already show the sample instead of "Keine Daten".
+        // should already show the sample instead of "No data".
         let srt = build_srt(&[Field::Depth], &samples, &times, 0.0, 10.0, 1.0);
-        assert!(srt.contains("Tiefe: 5.0 m"));
-        assert!(!srt.contains("Keine Daten"));
+        assert!(srt.contains("Depth: 5.0 m"));
+        assert!(!srt.contains("No data"));
     }
 }

@@ -22,14 +22,14 @@ pub fn parse_clip_spec(spec: &str) -> Result<ClipJob, CoreError> {
     let parts: Vec<&str> = spec.split('|').map(|p| p.trim()).collect();
     if parts.len() != 3 && parts.len() != 4 {
         return Err(CoreError::InvalidClipSpec(
-            "Ungültiges --clip Format. Erwartet: video_path|video_sync_sec|csv_sync_mmss[|output_path]".to_string(),
+            "Invalid --clip format. Expected: video_path|video_sync_sec|csv_sync_mmss[|output_path]".to_string(),
         ));
     }
 
     let video_path = PathBuf::from(parts[0]);
     let video_sync_sec: f64 = parts[1]
         .parse()
-        .map_err(|_| CoreError::InvalidClipSpec(format!("Ungültige video_sync_sec in --clip: {}", parts[1])))?;
+        .map_err(|_| CoreError::InvalidClipSpec(format!("Invalid video_sync_sec in --clip: {}", parts[1])))?;
     let csv_sync_sec = parse_duration_to_seconds(parts[2])?;
     let output_path = if parts.len() == 4 {
         PathBuf::from(parts[3])
@@ -52,7 +52,7 @@ fn parse_naive_utc(text: &str) -> Result<DateTime<Utc>, CoreError> {
             return Ok(DateTime::from_naive_utc_and_offset(naive, Utc));
         }
     }
-    Err(CoreError::Other(format!("Unbekanntes Datum/Zeit Format: {text}")))
+    Err(CoreError::Other(format!("Unknown date/time format: {text}")))
 }
 
 pub fn parse_datetime_utc(date_str: &str, time_str: &str) -> Result<DateTime<Utc>, CoreError> {
@@ -96,7 +96,7 @@ pub fn compute_auto_sync(csv_path: &Path, jobs: &mut [ClipJob], params: &AutoSyn
             resolved == base_clip_resolved
         })
         .map(|j| j.video_path.clone())
-        .ok_or_else(|| CoreError::Other("--base-clip muss einer der --clip Pfade sein".to_string()))?;
+        .ok_or_else(|| CoreError::Other("--base-clip must be one of the --clip paths".to_string()))?;
 
     let base_video_start = get_video_creation_time_utc(&base_job_video_path)?;
     let base_csv_dt = parse_datetime_text(params.base_csv_datetime)?;
@@ -106,13 +106,13 @@ pub fn compute_auto_sync(csv_path: &Path, jobs: &mut [ClipJob], params: &AutoSyn
         (Some(d), Some(c)) => (d, c),
         _ => {
             return Err(CoreError::Other(
-                "CSV braucht Datum- und Uhrzeit-Spalten für Auto-Sync".to_string(),
+                "CSV needs date and time columns for auto-sync".to_string(),
             ))
         }
     };
 
     let first_row = read_first_row_columns(csv_path, &[&date_col, &clock_col])?
-        .ok_or_else(|| CoreError::Other("CSV enthält keine Zeilen".to_string()))?;
+        .ok_or_else(|| CoreError::Other("CSV contains no rows".to_string()))?;
     let first_dt = parse_datetime_utc(&first_row[0], &first_row[1])?;
     let base_csv_dt_offset_sec = (base_csv_dt - first_dt).num_milliseconds() as f64 / 1000.0;
 

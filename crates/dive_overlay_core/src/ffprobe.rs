@@ -54,12 +54,12 @@ pub struct VideoInfo {
 pub fn ensure_ffmpeg_available() -> Result<(), CoreError> {
     if which::which("ffmpeg").is_err() {
         return Err(CoreError::Ffmpeg(
-            "ffmpeg wurde nicht gefunden. Bitte installieren und zum PATH hinzufügen.".to_string(),
+            "ffmpeg was not found. Please install it and add it to PATH.".to_string(),
         ));
     }
     if which::which("ffprobe").is_err() {
         return Err(CoreError::Ffprobe(
-            "ffprobe wurde nicht gefunden. Bitte installieren und zum PATH hinzufügen.".to_string(),
+            "ffprobe was not found. Please install it and add it to PATH.".to_string(),
         ));
     }
     Ok(())
@@ -98,7 +98,7 @@ pub fn parse_creation_time(text: &str) -> Result<DateTime<Utc>, CoreError> {
         }
     }
 
-    Err(CoreError::Ffprobe(format!("Unbekanntes creation_time Format: {text}")))
+    Err(CoreError::Ffprobe(format!("Unknown creation_time format: {text}")))
 }
 
 fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
@@ -108,7 +108,7 @@ fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
         .streams
         .iter()
         .find(|s| s.codec_type.as_deref() == Some("video"))
-        .ok_or_else(|| CoreError::Ffprobe("Kein Videostream gefunden".to_string()))?;
+        .ok_or_else(|| CoreError::Ffprobe("No video stream found".to_string()))?;
 
     let width = video_stream.width.unwrap_or(0);
     let height = video_stream.height.unwrap_or(0);
@@ -161,7 +161,7 @@ pub fn probe_video(video_path: &Path) -> Result<VideoInfo, CoreError> {
         .args(["-v", "error", "-print_format", "json", "-show_streams", "-show_format"])
         .arg(video_path)
         .output()
-        .map_err(|e| CoreError::Ffprobe(format!("ffprobe konnte nicht gestartet werden: {e}")))?;
+        .map_err(|e| CoreError::Ffprobe(format!("Failed to start ffprobe: {e}")))?;
 
     if !output.status.success() {
         return Err(CoreError::Ffprobe(String::from_utf8_lossy(&output.stderr).to_string()));

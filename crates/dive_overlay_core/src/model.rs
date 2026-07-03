@@ -55,16 +55,16 @@ impl Field {
     }
 }
 
-/// Formats a single field's value for display, mirroring the German labels
-/// used by the original tool. Returns `None` when the sample lacks that
-/// measurement, or for `Field::Time` (whose display line is built by the
-/// caller from the dive-elapsed-second, not from a per-sample value).
+/// Formats a single field's value for display. Returns `None` when the
+/// sample lacks that measurement, or for `Field::Time` (whose display line
+/// is built by the caller from the dive-elapsed-second, not from a
+/// per-sample value).
 pub fn value_for_field(sample: &DiveSample, field: Field) -> Option<String> {
     match field {
         Field::Time => None,
-        Field::Depth => sample.depth_m.map(|d| format!("Tiefe: {:.1} m", d)),
+        Field::Depth => sample.depth_m.map(|d| format!("Depth: {:.1} m", d)),
         Field::Temp => sample.temp_c.map(|t| format!("Temp: {:.1} C", t)),
-        Field::Pressure => sample.pressure_bar.map(|p| format!("Druck: {:.0} bar", p)),
-        Field::Hr => sample.heart_rate.map(|h| format!("Puls: {:.0} bpm", h)),
+        Field::Pressure => sample.pressure_bar.map(|p| format!("Pressure: {:.0} bar", p)),
+        Field::Hr => sample.heart_rate.map(|h| format!("HR: {:.0} bpm", h)),
     }
 }

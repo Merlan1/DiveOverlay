@@ -18,7 +18,7 @@ fn normalize_header(h: &str) -> String {
 pub fn parse_duration_to_seconds(value: &str) -> Result<f64, CoreError> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(CoreError::InvalidDuration("Leerer Zeitwert".to_string()));
+        return Err(CoreError::InvalidDuration("Empty time value".to_string()));
     }
 
     if !value.contains(':') {
@@ -28,7 +28,7 @@ pub fn parse_duration_to_seconds(value: &str) -> Result<f64, CoreError> {
     }
 
     let parts: Vec<&str> = value.split(':').collect();
-    let err = || CoreError::InvalidDuration(format!("Unbekanntes Zeitformat: {value}"));
+    let err = || CoreError::InvalidDuration(format!("Unknown time format: {value}"));
     match parts.len() {
         2 => {
             let minutes: i64 = parts[0].parse().map_err(|_| err())?;
@@ -146,7 +146,7 @@ pub fn parse_fields(value: &str) -> Result<Vec<Field>, CoreError> {
         .filter(|v| !v.is_empty())
         .collect();
     if raw_fields.is_empty() {
-        return Err(CoreError::InvalidFields("--fields darf nicht leer sein".to_string()));
+        return Err(CoreError::InvalidFields("--fields must not be empty".to_string()));
     }
 
     let mut fields = Vec::new();
@@ -160,7 +160,7 @@ pub fn parse_fields(value: &str) -> Result<Vec<Field>, CoreError> {
 
     if !unknown.is_empty() {
         return Err(CoreError::InvalidFields(format!(
-            "Unbekannte Felder in --fields: {}. Erlaubt: {}",
+            "Unknown fields in --fields: {}. Allowed: {}",
             unknown.join(", "),
             ALLOWED_FIELD_NAMES.join(", ")
         )));
@@ -179,17 +179,17 @@ pub fn parse_column_map(value: &str) -> Result<HashMap<String, String>, CoreErro
     for part in value.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()) {
         let Some((key, col)) = part.split_once('=') else {
             return Err(CoreError::InvalidColumnMap(
-                "--column-map Format: key=Spaltenname, z. B. time=TIME,depth=Depth".to_string(),
+                "--column-map format: key=ColumnName, e.g. time=TIME,depth=Depth".to_string(),
             ));
         };
         let key = key.trim();
         let col = col.trim();
         if !COLUMN_MAP_KEYS.contains(&key) {
-            return Err(CoreError::InvalidColumnMap(format!("Unbekannter column-map Key: {key}")));
+            return Err(CoreError::InvalidColumnMap(format!("Unknown column-map key: {key}")));
         }
         if col.is_empty() {
             return Err(CoreError::InvalidColumnMap(
-                "Spaltenname in --column-map darf nicht leer sein".to_string(),
+                "Column name in --column-map must not be empty".to_string(),
             ));
         }
         mapping.insert(key.to_string(), col.to_string());

@@ -2,23 +2,23 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
-    #[error("IO-Fehler: {0}")]
+    #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("CSV-Fehler: {0}")]
+    #[error("CSV error: {0}")]
     Csv(#[from] csv::Error),
-    #[error("JSON-Fehler: {0}")]
+    #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Ungültiger Zeitwert: {0}")]
+    #[error("Invalid time value: {0}")]
     InvalidDuration(String),
-    #[error("CSV hat keine Kopfzeile")]
+    #[error("CSV has no header row")]
     NoHeader,
-    #[error("CSV enthält keine verwertbaren Samples")]
+    #[error("CSV contains no usable samples")]
     NoSamples,
-    #[error("Keine Zeitspalte gefunden (z. B. 'sample time (min)')")]
+    #[error("No time column found (e.g. 'sample time (min)')")]
     MissingTimeColumn,
-    #[error("Keine Tiefenspalte gefunden (z. B. 'sample depth (m)')")]
+    #[error("No depth column found (e.g. 'sample depth (m)')")]
     MissingDepthColumn,
-    #[error("Spalte '{0}' nicht gefunden")]
+    #[error("Column '{0}' not found")]
     ColumnNotFound(String),
     #[error("{0}")]
     InvalidColumnMap(String),
@@ -26,13 +26,13 @@ pub enum CoreError {
     InvalidFields(String),
     #[error("{0}")]
     InvalidClipSpec(String),
-    #[error("Video nicht gefunden: {0}")]
+    #[error("Video not found: {0}")]
     VideoNotFound(PathBuf),
-    #[error("CSV nicht gefunden: {0}")]
+    #[error("CSV not found: {0}")]
     CsvNotFound(PathBuf),
-    #[error("ffprobe-Fehler: {0}")]
+    #[error("ffprobe error: {0}")]
     Ffprobe(String),
-    #[error("ffmpeg-Fehler: {0}")]
+    #[error("ffmpeg error: {0}")]
     Ffmpeg(String),
     #[error("{0}")]
     Other(String),

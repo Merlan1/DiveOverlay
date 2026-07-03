@@ -45,13 +45,13 @@ fn blend_rect_alpha(img: &mut RgbImage, x: i32, y: i32, w: u32, h: u32, color: R
 
 /// Builds the display lines for the info box at `dive_sec`: the elapsed dive
 /// time (if requested) plus the latest known value for every other
-/// requested field, falling back to "Keine Daten" if nothing is available
-/// yet. Centralizing this (the original duplicated it between the CLI's
-/// frame loop and the GUI's preview code) keeps CLI/GUI rendering identical.
+/// requested field, falling back to "No data" if nothing is available yet.
+/// Centralizing this (the original duplicated it between the CLI's frame
+/// loop and the GUI's preview code) keeps CLI/GUI rendering identical.
 pub fn build_overlay_lines(fields: &[Field], samples: &[DiveSample], times: &[f64], dive_sec: f64) -> Vec<String> {
     let mut lines = Vec::new();
     if fields.contains(&Field::Time) {
-        lines.push(format!("Tauchzeit: {}", format_duration(dive_sec)));
+        lines.push(format!("Dive time: {}", format_duration(dive_sec)));
     }
 
     if let Some(idx) = choose_sample_index(times, dive_sec) {
@@ -66,7 +66,7 @@ pub fn build_overlay_lines(fields: &[Field], samples: &[DiveSample], times: &[f6
     }
 
     if lines.is_empty() {
-        lines.push("Keine Daten".to_string());
+        lines.push("No data".to_string());
     }
     lines
 }
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn build_overlay_lines_falls_back_to_no_data() {
         let lines = build_overlay_lines(&[Field::Depth], &[], &[], 5.0);
-        assert_eq!(lines, vec!["Keine Daten".to_string()]);
+        assert_eq!(lines, vec!["No data".to_string()]);
     }
 
     #[test]
@@ -285,8 +285,8 @@ mod tests {
         let samples = vec![sample(0.0, 1.5)];
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
         let lines = build_overlay_lines(&[Field::Time, Field::Depth], &samples, &times, 10.0);
-        assert_eq!(lines[0], "Tauchzeit: 00:10");
-        assert_eq!(lines[1], "Tiefe: 1.5 m");
+        assert_eq!(lines[0], "Dive time: 00:10");
+        assert_eq!(lines[1], "Depth: 1.5 m");
     }
 
     #[test]
@@ -304,14 +304,14 @@ mod tests {
     fn draw_overlay_does_not_panic_on_small_image() {
         let mut img = RgbImage::new(320, 240);
         let mut cache = OverlayCache::new();
-        draw_overlay(&mut img, &["Tauchzeit: 00:10".to_string()], &mut cache);
+        draw_overlay(&mut img, &["Dive time: 00:10".to_string()], &mut cache);
     }
 
     #[test]
     fn draw_overlay_reuses_cached_tile_for_identical_lines_and_rerenders_on_change() {
         let mut img = RgbImage::new(320, 240);
         let mut cache = OverlayCache::new();
-        let lines = vec!["Tauchzeit: 00:10".to_string(), "Tiefe: 1.5 m".to_string()];
+        let lines = vec!["Dive time: 00:10".to_string(), "Depth: 1.5 m".to_string()];
 
         draw_overlay(&mut img, &lines, &mut cache);
         let tile_ptr_before = cache.tile.as_ref().unwrap().image.as_raw().as_ptr();
@@ -319,7 +319,7 @@ mod tests {
         let tile_ptr_after = cache.tile.as_ref().unwrap().image.as_raw().as_ptr();
         assert_eq!(tile_ptr_before, tile_ptr_after, "unchanged lines must reuse the cached tile");
 
-        let other_lines = vec!["Tauchzeit: 00:20".to_string(), "Tiefe: 2.0 m".to_string()];
+        let other_lines = vec!["Dive time: 00:20".to_string(), "Depth: 2.0 m".to_string()];
         draw_overlay(&mut img, &other_lines, &mut cache);
         assert_eq!(cache.tile.as_ref().unwrap().lines, other_lines);
     }

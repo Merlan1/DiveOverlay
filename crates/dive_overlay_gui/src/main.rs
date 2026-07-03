@@ -25,7 +25,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Tauchdaten Overlay",
+        "Dive Data Overlay",
         options,
         Box::new(|cc| {
             let mut app = App::default();
@@ -88,18 +88,18 @@ impl ClipDialogState {
     fn validate(&self) -> Result<ClipEntry, String> {
         let video = self.video.trim();
         if video.is_empty() {
-            return Err("Bitte eine Videodatei wählen.".to_string());
+            return Err("Please select a video file.".to_string());
         }
         let output = self.output.trim();
         if output.is_empty() {
-            return Err("Bitte einen Output-Pfad angeben.".to_string());
+            return Err("Please specify an output path.".to_string());
         }
         let video_sync_sec: f64 = self
             .video_sync
             .trim()
             .parse()
-            .map_err(|_| "Video Sync muss eine Zahl sein.".to_string())?;
-        parse_duration_to_seconds(self.csv_sync.trim()).map_err(|e| format!("CSV Sync ungültig: {e}"))?;
+            .map_err(|_| "Video sync must be a number.".to_string())?;
+        parse_duration_to_seconds(self.csv_sync.trim()).map_err(|e| format!("CSV sync invalid: {e}"))?;
 
         Ok(ClipEntry {
             video_path: PathBuf::from(video),
@@ -156,7 +156,7 @@ impl Default for App {
             mode: OutputMode::Overlay,
             entries: Vec::new(),
             selected: None,
-            status: "Bereit".to_string(),
+            status: "Ready".to_string(),
             progress: 0.0,
             fps: 0.0,
             encoder_info: String::new(),
@@ -221,12 +221,12 @@ impl App {
             }
             match result {
                 Ok(()) => {
-                    self.status = "Fertig".to_string();
+                    self.status = "Done".to_string();
                     self.progress = 100.0;
                 }
                 Err(e) => {
-                    self.status = "Fehler".to_string();
-                    self.log_lines.push(format!("Fehler: {e}"));
+                    self.status = "Error".to_string();
+                    self.log_lines.push(format!("Error: {e}"));
                 }
             }
             ctx.request_repaint();
@@ -243,7 +243,7 @@ impl App {
             }
             UpdateStatus::UpToDate => {}
             UpdateStatus::Error(e) => {
-                self.log_lines.push(format!("Update-Prüfung fehlgeschlagen: {e}"));
+                self.log_lines.push(format!("Update check failed: {e}"));
             }
         }
     }
@@ -251,45 +251,45 @@ impl App {
     fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
         let Some((version, url)) = &self.update_available else { return };
         ui.horizontal(|ui| {
-            ui.colored_label(egui::Color32::YELLOW, format!("Neue Version verfügbar: {version}"));
+            ui.colored_label(egui::Color32::YELLOW, format!("New version available: {version}"));
             ui.hyperlink_to("Download", url);
         });
         ui.separator();
     }
 
     fn ui_general(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Tauchdaten Overlay");
+        ui.heading("Dive Data Overlay");
         ui.horizontal(|ui| {
             ui.label("CSV:");
             ui.text_edit_singleline(&mut self.csv_path);
-            if ui.button("Durchsuchen").clicked() {
+            if ui.button("Browse").clicked() {
                 if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).pick_file() {
                     self.csv_path = path.display().to_string();
                 }
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Felder (time,depth,temp,pressure,hr):");
+            ui.label("Fields (time,depth,temp,pressure,hr):");
             ui.text_edit_singleline(&mut self.fields);
         });
         ui.horizontal(|ui| {
-            ui.label("Spaltenzuordnung (z.B. time=TIME,depth=Depth):");
+            ui.label("Column mapping (e.g. time=TIME,depth=Depth):");
             ui.text_edit_singleline(&mut self.column_map);
         });
         ui.horizontal(|ui| {
-            ui.label("Modus:");
+            ui.label("Mode:");
             egui::ComboBox::from_id_salt("mode")
                 .selected_text(match self.mode {
-                    OutputMode::Overlay => "Overlay (eingebrannt)",
-                    OutputMode::Subtitles => "Untertitel (an/aus schaltbar)",
+                    OutputMode::Overlay => "Overlay (burned-in)",
+                    OutputMode::Subtitles => "Subtitles (toggle on/off)",
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.mode, OutputMode::Overlay, "Overlay (eingebrannt)");
-                    ui.selectable_value(&mut self.mode, OutputMode::Subtitles, "Untertitel (an/aus schaltbar)");
+                    ui.selectable_value(&mut self.mode, OutputMode::Overlay, "Overlay (burned-in)");
+                    ui.selectable_value(&mut self.mode, OutputMode::Subtitles, "Subtitles (toggle on/off)");
                 });
 
             ui.add_enabled_ui(self.mode == OutputMode::Overlay, |ui| {
-                ui.checkbox(&mut self.show_graph, "Tiefenprofil anzeigen");
+                ui.checkbox(&mut self.show_graph, "Show depth profile");
             });
         });
         let subtitle_mode = self.mode == OutputMode::Subtitles;
@@ -324,12 +324,12 @@ impl App {
             ui.add_enabled_ui(!subtitle_mode, |ui| {
                 let hw_applies = Codec::parse(&self.codec).supports_preset();
                 ui.add_enabled_ui(hw_applies, |ui| {
-                    ui.checkbox(&mut self.hw_accel, "Hardware-Beschleunigung (falls verfügbar)");
+                    ui.checkbox(&mut self.hw_accel, "Hardware acceleration (if available)");
                 });
             });
         });
         if subtitle_mode {
-            ui.label("Hinweis: Untertitel-Modus kopiert Video/Audio verlustfrei und schreibt zusätzlich eine .srt Datei neben der Ausgabe.");
+            ui.label("Note: subtitle mode copies video/audio losslessly and additionally writes a .srt file next to the output.");
         }
         if !self.encoder_info.is_empty() {
             ui.label(format!("Encoder: {}", self.encoder_info));
@@ -339,21 +339,21 @@ impl App {
     fn ui_clip_table(&mut self, ui: &mut egui::Ui) {
         ui.heading("Clips");
         ui.horizontal(|ui| {
-            if ui.button("Clip hinzufügen").clicked() {
+            if ui.button("Add clip").clicked() {
                 self.dialog = Some(ClipDialogState::new_add());
             }
-            if ui.button("Clip bearbeiten").clicked() {
+            if ui.button("Edit clip").clicked() {
                 if let Some(idx) = self.selected {
                     self.dialog = Some(ClipDialogState::new_edit(idx, &self.entries[idx]));
                 }
             }
-            if ui.button("Clip entfernen").clicked() {
+            if ui.button("Remove clip").clicked() {
                 if let Some(idx) = self.selected {
                     self.entries.remove(idx);
                     self.selected = None;
                 }
             }
-            if ui.button("Sync Vorschau").clicked() {
+            if ui.button("Sync preview").clicked() {
                 if let Some(idx) = self.selected {
                     let ctx = ui.ctx().clone();
                     self.render_preview(idx, &ctx);
@@ -432,9 +432,9 @@ impl App {
         let mut submit = false;
         let mut cancel = false;
         let title = if dialog.editing_index.is_some() {
-            "Clip bearbeiten"
+            "Edit clip"
         } else {
-            "Clip hinzufügen"
+            "Add clip"
         };
 
         egui::Window::new(title)
@@ -445,7 +445,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Video:");
                     ui.text_edit_singleline(&mut dialog.video);
-                    if ui.button("Durchsuchen").clicked() {
+                    if ui.button("Browse").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Video", &["mp4", "mov", "avi", "mkv"])
                             .pick_file()
@@ -459,17 +459,17 @@ impl App {
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Video Sync (Sekunden):");
+                    ui.label("Video sync (seconds):");
                     ui.text_edit_singleline(&mut dialog.video_sync);
                 });
                 ui.horizontal(|ui| {
-                    ui.label("CSV Sync (mm:ss oder hh:mm:ss):");
+                    ui.label("CSV sync (mm:ss or hh:mm:ss):");
                     ui.text_edit_singleline(&mut dialog.csv_sync);
                 });
                 ui.horizontal(|ui| {
                     ui.label("Output:");
                     ui.text_edit_singleline(&mut dialog.output);
-                    if ui.button("Speichern unter").clicked() {
+                    if ui.button("Save as").clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("MP4", &["mp4"]).save_file() {
                             dialog.output = path.display().to_string();
                         }
@@ -479,7 +479,7 @@ impl App {
                     ui.colored_label(egui::Color32::RED, err);
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Abbrechen").clicked() {
+                    if ui.button("Cancel").clicked() {
                         cancel = true;
                     }
                     if ui.button("OK").clicked() {
@@ -514,13 +514,13 @@ impl App {
         let mut adjust: Option<f64> = None;
         let mut reload = false;
 
-        egui::Window::new("Sync Vorschau")
+        egui::Window::new("Sync preview")
             .open(&mut open)
             .resizable(true)
             .show(ctx, |ui| {
                 if let Some(entry) = self.entries.get(clip_index) {
                     ui.label(format!(
-                        "Video: {} | Video Sync: {:.2}s | CSV Sync: {}",
+                        "Video: {} | Video sync: {:.2}s | CSV sync: {}",
                         entry
                             .video_path
                             .file_name()
@@ -546,7 +546,7 @@ impl App {
                             adjust = Some(delta);
                         }
                     }
-                    if ui.button("Neu laden").clicked() {
+                    if ui.button("Reload").clicked() {
                         reload = true;
                     }
                 });
@@ -580,7 +580,7 @@ impl App {
     fn render_preview(&mut self, idx: usize, ctx: &egui::Context) {
         match self.try_render_preview(idx, ctx) {
             Ok(preview) => self.preview = Some(preview),
-            Err(e) => self.log_lines.push(format!("Vorschau fehlgeschlagen: {e}")),
+            Err(e) => self.log_lines.push(format!("Preview failed: {e}")),
         }
     }
 
@@ -588,14 +588,14 @@ impl App {
         let entry = self
             .entries
             .get(idx)
-            .ok_or_else(|| anyhow::anyhow!("Ungültiger Clip-Index"))?;
+            .ok_or_else(|| anyhow::anyhow!("Invalid clip index"))?;
         if !entry.video_path.exists() {
-            anyhow::bail!("Video nicht gefunden: {}", entry.video_path.display());
+            anyhow::bail!("Video not found: {}", entry.video_path.display());
         }
 
         let csv_path = PathBuf::from(self.csv_path.trim());
         if self.csv_path.trim().is_empty() || !csv_path.exists() {
-            anyhow::bail!("Bitte erst eine gültige CSV-Datei auswählen.");
+            anyhow::bail!("Please select a valid CSV file first.");
         }
 
         let fields = parse_fields(&self.fields)?;
@@ -627,15 +627,15 @@ impl App {
     fn ui_execution(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.running, egui::Button::new("Verarbeitung starten"))
+                .add_enabled(!self.running, egui::Button::new("Start processing"))
                 .clicked()
             {
                 self.start_processing(ctx);
             }
-            if ui.add_enabled(self.running, egui::Button::new("Abbruch")).clicked() {
+            if ui.add_enabled(self.running, egui::Button::new("Cancel")).clicked() {
                 self.cancel_flag.store(true, Ordering::Relaxed);
-                self.log_lines.push("Abbruch angefordert...".to_string());
-                self.status = "Abbruch...".to_string();
+                self.log_lines.push("Cancel requested...".to_string());
+                self.status = "Cancelling...".to_string();
             }
             ui.label(&self.status);
         });
@@ -661,29 +661,29 @@ impl App {
 
         let csv_path = PathBuf::from(self.csv_path.trim());
         if self.csv_path.trim().is_empty() {
-            self.log_lines.push("Fehler: Bitte CSV-Datei auswählen.".to_string());
+            self.log_lines.push("Error: please select a CSV file.".to_string());
             return;
         }
         if !csv_path.exists() {
-            self.log_lines.push(format!("Fehler: CSV nicht gefunden: {}", csv_path.display()));
+            self.log_lines.push(format!("Error: CSV not found: {}", csv_path.display()));
             return;
         }
         if self.entries.is_empty() {
-            self.log_lines.push("Fehler: Bitte mindestens einen Clip hinzufügen.".to_string());
+            self.log_lines.push("Error: please add at least one clip.".to_string());
             return;
         }
 
         let fields = match parse_fields(&self.fields) {
             Ok(f) => f,
             Err(e) => {
-                self.log_lines.push(format!("Fehler: Feldliste ungültig: {e}"));
+                self.log_lines.push(format!("Error: invalid field list: {e}"));
                 return;
             }
         };
         let column_map = match parse_column_map(&self.column_map) {
             Ok(m) => m,
             Err(e) => {
-                self.log_lines.push(format!("Fehler: Spaltenzuordnung ungültig: {e}"));
+                self.log_lines.push(format!("Error: invalid column mapping: {e}"));
                 return;
             }
         };
@@ -691,7 +691,7 @@ impl App {
         for entry in &self.entries {
             if !entry.video_path.exists() {
                 self.log_lines
-                    .push(format!("Fehler: Video nicht gefunden: {}", entry.video_path.display()));
+                    .push(format!("Error: video not found: {}", entry.video_path.display()));
                 return;
             }
         }
@@ -709,11 +709,11 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.worker_rx = Some(rx);
         self.running = true;
-        self.status = "Verarbeite...".to_string();
+        self.status = "Processing...".to_string();
         self.progress = 0.0;
         self.fps = 0.0;
         self.encoder_info = String::new();
-        self.log_lines.push("Starte Verarbeitung...".to_string());
+        self.log_lines.push("Starting processing...".to_string());
 
         let worker_ctx = ctx.clone();
         let handle = std::thread::spawn(move || {
@@ -842,7 +842,7 @@ fn run_worker(
         .map_err(|e| e.to_string())?;
 
         if !completed {
-            let _ = tx.send(WorkerEvent::Log("Abbruch: Verarbeitung gestoppt.".to_string()));
+            let _ = tx.send(WorkerEvent::Log("Cancelled: processing stopped.".to_string()));
             return Ok(());
         }
 
@@ -850,7 +850,7 @@ fn run_worker(
         let percent = (base_done_frames as f64 * 100.0 / total_frames_all as f64) as f32;
         let _ = tx.send(WorkerEvent::Progress(percent));
         let _ = tx.send(WorkerEvent::Log(format!(
-            "[{}/{}] Fertig: {}",
+            "[{}/{}] Done: {}",
             idx + 1,
             total,
             job.output_path.display()
@@ -888,7 +888,7 @@ mod tests {
 
     /// Exercises the exact function `start_processing` spawns on its
     /// background thread, end to end, without going through the eframe UI.
-    /// This is what a click-through of "Verarbeitung starten" would
+    /// This is what a click-through of "Start processing" would
     /// ultimately trigger -- calling it directly gives deterministic proof
     /// that the worker/channel wiring produces progress + a finished output,
     /// which a screenshot of a dialog box would not.
@@ -937,7 +937,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, WorkerEvent::Log(l) if l.contains("Fertig"))),
+                .any(|e| matches!(e, WorkerEvent::Log(l) if l.contains("Done"))),
             "expected a completion log line"
         );
     }
@@ -980,6 +980,6 @@ mod tests {
         let events: Vec<WorkerEvent> = rx.try_iter().collect();
         assert!(events
             .iter()
-            .any(|e| matches!(e, WorkerEvent::Log(l) if l.contains("Abbruch"))));
+            .any(|e| matches!(e, WorkerEvent::Log(l) if l.contains("Cancelled"))));
     }
 }

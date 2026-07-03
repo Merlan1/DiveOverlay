@@ -13,82 +13,81 @@ use dive_overlay_core::pipeline::{process_clip, Codec, OutputMode, Preset, Proce
 use dive_overlay_core::sync::{compute_auto_sync, derive_output_path, parse_clip_spec, AutoSyncParams};
 use dive_overlay_core::ClipJob;
 
-/// Blendet Tauchdaten aus CSV über ein Video ein.
+/// Overlays dive telemetry from a CSV onto a video.
 #[derive(Parser, Debug)]
-#[command(about = "Blendet Tauchdaten aus CSV über ein Video ein")]
+#[command(about = "Overlays dive telemetry from a CSV onto a video")]
 struct Args {
-    /// Pfad zur CSV-Datei
+    /// Path to the CSV file
     #[arg(long)]
     csv: PathBuf,
 
-    /// Pfad zur Video-Datei (Single-Clip Modus)
+    /// Path to the video file (single-clip mode)
     #[arg(long)]
     video: Option<PathBuf>,
 
-    /// Ausgabedatei (Standard: <video_stem>_overlay.mp4)
+    /// Output file (default: <video_stem>_overlay.mp4)
     #[arg(long)]
     output: Option<PathBuf>,
 
-    /// Sekunde im Video, bei der die CSV-Sync-Zeit gilt
+    /// Second in the video at which the CSV sync time applies
     #[arg(long, default_value_t = 0.0)]
     video_sync_sec: f64,
 
-    /// Tauchzeit am Sync-Punkt (Format mm:ss oder hh:mm:ss)
+    /// Dive time at the sync point (format mm:ss or hh:mm:ss)
     #[arg(long, default_value = "0:00")]
     csv_sync_mmss: String,
 
-    /// Anzuzeigende Felder: time,depth,temp,pressure,hr
+    /// Fields to display: time,depth,temp,pressure,hr
     #[arg(long, default_value = "time,depth,temp,pressure,hr")]
     fields: String,
 
-    /// CSV-Spaltenzuordnung: time=...,depth=...,temp=...,pressure=...,hr=...,date=...,clock=...
+    /// CSV column mapping: time=...,depth=...,temp=...,pressure=...,hr=...,date=...,clock=...
     #[arg(long, default_value = "")]
     column_map: String,
 
-    /// Video-Codec: auto, avc1, H264, hevc/H265, mp4v, XVID, MJPG
+    /// Video codec: auto, avc1, H264, hevc/H265, mp4v, XVID, MJPG
     #[arg(long, default_value = "auto")]
     codec: String,
 
-    /// Encoder-Preset fuer H264/H265 (Geschwindigkeit vs. Kompression):
+    /// Encoder preset for H264/H265 (speed vs. compression):
     /// ultrafast, superfast, veryfast, faster, fast, medium, slow, slower,
-    /// veryslow, placebo. Wird fuer andere Codecs ignoriert.
+    /// veryslow, placebo. Ignored for other codecs.
     #[arg(long, default_value = "veryfast")]
     preset: String,
 
-    /// Versucht Hardware-Beschleunigung (z. B. Intel Quick Sync) fuer
-    /// H264/H265 zu nutzen; faellt automatisch auf Software zurueck, falls
-    /// keine passende Hardware gefunden wird. Wird fuer andere Codecs
-    /// ignoriert.
+    /// Tries to use hardware acceleration (e.g. Intel Quick Sync) for
+    /// H264/H265; falls back to software automatically if no matching
+    /// hardware is found. Ignored for other codecs.
     #[arg(long)]
     hw_accel: bool,
 
-    /// Zeigt kleines Tiefenprofil (Graph) an
+    /// Shows a small depth profile (graph)
     #[arg(long)]
     show_graph: bool,
 
-    /// Ausgabe-Modus: overlay (in Pixel eingebrannt) oder subtitles (weiche,
-    /// im Player an/aus schaltbare Untertitelspur statt Overlay)
+    /// Output mode: overlay (burned into pixels) or subtitles (soft
+    /// subtitle track, toggleable on/off in the player, instead of overlay)
     #[arg(long, default_value = "overlay")]
     mode: String,
 
-    /// Automatisches Sync basierend auf MP4 CreationTime + CSV Datum/Uhrzeit
+    /// Automatic sync based on MP4 CreationTime + CSV date/time
     #[arg(long)]
     auto_sync: bool,
 
-    /// Clip-Pfad fuer Auto-Sync (muss in --clip enthalten sein)
+    /// Clip path for auto-sync (must be one of the --clip paths)
     #[arg(long, default_value = "")]
     base_clip: String,
 
-    /// Video-Sekunde des manuellen Sync-Punkts (nur Auto-Sync)
+    /// Video second of the manual sync point (auto-sync only)
     #[arg(long, default_value_t = 0.0)]
     base_video_sync_sec: f64,
 
-    /// CSV Datum/Uhrzeit am Sync-Punkt (ISO: YYYY-MM-DD HH:MM:SS)
+    /// CSV date/time at the sync point (ISO: YYYY-MM-DD HH:MM:SS)
     #[arg(long, default_value = "")]
     base_csv_datetime: String,
 
-    /// Mehrere Clips verarbeiten. Format: video_path|video_sync_sec|csv_sync_mmss[|output_path].
-    /// Kann mehrfach angegeben werden.
+    /// Process multiple clips. Format: video_path|video_sync_sec|csv_sync_mmss[|output_path].
+    /// Can be used multiple times.
     #[arg(long = "clip")]
     clip: Vec<String>,
 }
@@ -101,7 +100,7 @@ fn build_jobs(args: &Args) -> Result<Vec<ClipJob>> {
     let video = args
         .video
         .clone()
-        .ok_or_else(|| anyhow!("Bitte --video angeben oder mindestens ein --clip verwenden"))?;
+        .ok_or_else(|| anyhow!("Please specify --video or at least one --clip"))?;
     let output = derive_output_path(&video, args.output.clone());
     let csv_sync_sec = parse_duration_to_seconds(&args.csv_sync_mmss)?;
 
@@ -119,7 +118,7 @@ fn main() -> Result<()> {
     ensure_ffmpeg_available()?;
 
     if !args.csv.exists() {
-        bail!("CSV nicht gefunden: {}", args.csv.display());
+        bail!("CSV not found: {}", args.csv.display());
     }
 
     let fields = parse_fields(&args.fields)?;
@@ -128,7 +127,7 @@ fn main() -> Result<()> {
 
     for job in &jobs {
         if !job.video_path.exists() {
-            bail!("Video nicht gefunden: {}", job.video_path.display());
+            bail!("Video not found: {}", job.video_path.display());
         }
     }
 
@@ -137,13 +136,13 @@ fn main() -> Result<()> {
 
     if args.auto_sync {
         if args.clip.is_empty() {
-            bail!("Auto-Sync benötigt --clip Angaben");
+            bail!("Auto-sync requires --clip entries");
         }
         if args.base_clip.is_empty() {
-            bail!("Auto-Sync benötigt --base-clip");
+            bail!("Auto-sync requires --base-clip");
         }
         if args.base_csv_datetime.is_empty() {
-            bail!("Auto-Sync benötigt --base-csv-datetime");
+            bail!("Auto-sync requires --base-csv-datetime");
         }
 
         let base_clip = PathBuf::from(&args.base_clip);
@@ -156,10 +155,10 @@ fn main() -> Result<()> {
     }
 
     let mode = OutputMode::parse(&args.mode)
-        .ok_or_else(|| anyhow!("Ungültiger --mode Wert: {} (erwartet: overlay, subtitles)", args.mode))?;
+        .ok_or_else(|| anyhow!("Invalid --mode value: {} (expected: overlay, subtitles)", args.mode))?;
     let preset = Preset::parse(&args.preset).ok_or_else(|| {
         anyhow!(
-            "Ungültiger --preset Wert: {} (erwartet: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo)",
+            "Invalid --preset value: {} (expected: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo)",
             args.preset
         )
     })?;
@@ -194,7 +193,7 @@ fn main() -> Result<()> {
                 // includes that wait, not just frame processing -- computing an
                 // fps from it would read as a bogus last-moment slowdown.
                 if total_frames > 0 && done >= total_frames {
-                    print!("\r[{}/{}] Frame {}/{} (fertig)   ", i + 1, total, done, total_frames);
+                    print!("\r[{}/{}] Frame {}/{} (done)   ", i + 1, total, done, total_frames);
                     let _ = std::io::stdout().flush();
                     printed_progress = true;
                     return;
@@ -216,12 +215,12 @@ fn main() -> Result<()> {
             },
             |info| println!("[{}/{}] Encoder: {}", i + 1, total, info.describe()),
         )
-        .with_context(|| format!("Verarbeitung fehlgeschlagen: {}", job.video_path.display()))?;
+        .with_context(|| format!("Processing failed: {}", job.video_path.display()))?;
 
         if printed_progress {
             println!();
         }
-        println!("[{}/{}] Fertig: {}", i + 1, total, job.output_path.display());
+        println!("[{}/{}] Done: {}", i + 1, total, job.output_path.display());
     }
 
     Ok(())

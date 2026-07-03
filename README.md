@@ -1,50 +1,50 @@
-# Tauchdaten-Overlay (Rust)
+# Dive Data Overlay (Rust)
 
-Dieses Tool blendet die Werte aus einer Tauchgang-CSV in ein Video ein: Tiefe, Temperatur, Druck, Puls und Tauchzeit. Es unterstuetzt mehrere Videoclips mit Pausen dazwischen, jeder Clip mit eigenem Sync-Punkt, sowie automatisches Sync ueber die Aufnahmezeit der MP4-Dateien.
+This tool overlays the values from a dive-log CSV onto a video: depth, temperature, pressure, heart rate, and dive time. It supports multiple video clips with gaps in between, each clip with its own sync point, as well as automatic sync via the MP4 files' recording time.
 
-Zwei Ausgabe-Modi stehen zur Wahl:
+Two output modes are available:
 
-- **Overlay** (Standard): die Werte werden fest in die Video-Pixel eingebrannt.
-- **Untertitel**: die Werte werden stattdessen als weiche Untertitelspur (SRT/`mov_text`) geschrieben, die sich im Player nachtraeglich an- und ausschalten laesst. Video/Audio werden dabei verlustfrei kopiert (kein Re-Encode), zusaetzlich entsteht eine `.srt`-Sidecar-Datei neben der Ausgabe.
+- **Overlay** (default): the values are burned directly into the video pixels.
+- **Subtitles**: the values are instead written as a soft subtitle track (SRT/`mov_text`) that can be toggled on and off in the player afterward. Video/audio are copied losslessly (no re-encode), and an additional `.srt` sidecar file is created next to the output.
 
-Ehemals ein Python/OpenCV-Skript, jetzt ein Rust-Workspace, der fuer Dekodierung/Encodierung `ffmpeg`/`ffprobe` als Subprozess nutzt (kein OpenCV/libav-Linking noetig).
+Formerly a Python/OpenCV script, now a Rust workspace that uses `ffmpeg`/`ffprobe` as a subprocess for decoding/encoding (no OpenCV/libav linking needed).
 
 ## Screenshots
 
-Overlay-Beispiel aus einem gerenderten Clip:
+Overlay example from a rendered clip:
 
-![Overlay Beispiel](screenshots/Preview.png)
+![Overlay example](screenshots/Preview.png)
 
-## Workspace-Layout
+## Workspace layout
 
-- `crates/dive_overlay_core` — Bibliothek: CSV-Parsing, Sample-Lookup, Overlay-Zeichnen, ffprobe-Wrapper, ffmpeg-Pipeline, Multi-Clip/Auto-Sync
-- `crates/dive_overlay_cli` — CLI-Binary (clap)
-- `crates/dive_overlay_gui` — GUI-Binary (egui/eframe)
+- `crates/dive_overlay_core` — library: CSV parsing, sample lookup, overlay drawing, ffprobe wrapper, ffmpeg pipeline, multi-clip/auto-sync
+- `crates/dive_overlay_cli` — CLI binary (clap)
+- `crates/dive_overlay_gui` — GUI binary (egui/eframe)
 
-## Voraussetzungen
+## Requirements
 
 - Rust (stable, 2021 edition) via [rustup](https://rustup.rs/)
-- `ffmpeg` und `ffprobe` im PATH (z. B. `winget install Gyan.FFmpeg` unter Windows, oder das Paket der jeweiligen Distribution)
+- `ffmpeg` and `ffprobe` on PATH (e.g. `winget install Gyan.FFmpeg` on Windows, or your distribution's package)
 
-## Bauen
+## Building
 
 ```bash
 cargo build --release
 ```
 
-Binaries landen in `target/release/dive_overlay_cli(.exe)` und `target/release/dive_overlay_gui(.exe)`.
+Binaries end up in `target/release/dive_overlay_cli(.exe)` and `target/release/dive_overlay_gui(.exe)`.
 
-## Testen
+## Testing
 
 ```bash
 cargo test --workspace
 ```
 
-Die Test-Suite deckt CSV-Parsing, Sample-Lookup, Overlay-Zeichnen, Untertitel-Generierung, ffprobe-Parsing sowie die volle ffmpeg-Pipeline ab (Dekodieren/Overlay/Encodieren+Audio-Mux, Untertitel-Remux, Abbruch, Multi-Clip-Auto-Sync). Ein Teil der Tests synthetisiert Testclips per `ffmpeg -f lavfi` und benoetigt daher ein funktionierendes `ffmpeg` im PATH. Ein Test fuer Hardware-Beschleunigung laeuft nur, wenn diese Maschine tatsaechlich einen funktionierenden Hardware-Encoder hat (z. B. Intel Quick Sync) — andernfalls wird er uebersprungen, statt fehlzuschlagen.
+The test suite covers CSV parsing, sample lookup, overlay drawing, subtitle generation, ffprobe parsing, and the full ffmpeg pipeline (decode/overlay/encode+audio mux, subtitle remux, cancellation, multi-clip auto-sync). Some tests synthesize test clips via `ffmpeg -f lavfi` and therefore need a working `ffmpeg` on PATH. A hardware-acceleration test only runs if this machine actually has a working hardware encoder (e.g. Intel Quick Sync) — otherwise it's skipped rather than failing.
 
-## Erwartetes CSV-Format
+## Expected CSV format
 
-Das Tool erkennt die Spaltennamen flexibel. Mit der Beispiel-Datei `dive.csv` funktioniert es direkt, z. B. mit:
+The tool recognizes column names flexibly. It works directly with the sample file `dive.csv`, e.g. with:
 
 - `sample time (min)`
 - `sample depth (m)`
@@ -52,27 +52,27 @@ Das Tool erkennt die Spaltennamen flexibel. Mit der Beispiel-Datei `dive.csv` fu
 - `sample pressure (bar)`
 - `sample heartrate`
 
-## Verwendung
+## Usage
 
-### GUI starten
+### Starting the GUI
 
 ```bash
 cargo run --release --bin dive_overlay_gui
 ```
 
-In der GUI:
+In the GUI:
 
-- CSV-Datei auswaehlen
-- Felder setzen (z. B. `time,depth,temp`)
-- Modus waehlen: `Overlay (eingebrannt)` oder `Untertitel (an/aus schaltbar)`, daneben Tiefenprofil aktivieren (nur Overlay-Modus)
-- Im Overlay-Modus bei Bedarf Codec waehlen (`auto` empfohlen, sonst z. B. `avc1`, `H264` oder `hevc`), Preset (Geschwindigkeit vs. Kompression) und optional Hardware-Beschleunigung
-- Clips einzeln hinzufuegen (Video, Video-Sync, CSV-Sync, Output)
-- Mit `Sync Vorschau` den Frame an der Sync-Stelle inkl. Overlay kontrollieren
-- In der Vorschau mit `-0.5s` / `+0.5s` (bis `-1 min` / `+1 min`) den Sync feinjustieren
-- Verarbeitung starten
-- Fortschritt wird als Prozentbalken (inkl. fps) waehrend der Verarbeitung angezeigt, darunter erscheint der tatsaechlich genutzte Encoder (Software oder Hardware), Abbruch jederzeit moeglich
+- Select a CSV file
+- Set fields (e.g. `time,depth,temp`)
+- Choose mode: `Overlay (burned-in)` or `Subtitles (toggle on/off)`, with a depth-profile toggle next to it (overlay mode only)
+- In overlay mode, choose a codec if needed (`auto` recommended, otherwise e.g. `avc1`, `H264`, or `hevc`), a preset (speed vs. compression), and optionally hardware acceleration
+- Add clips individually (video, video sync, CSV sync, output)
+- Use `Sync preview` to check the frame at the sync point including the overlay
+- Fine-tune the sync in the preview with `-0.5s` / `+0.5s` (up to `-1 min` / `+1 min`)
+- Start processing
+- Progress is shown as a percentage bar (including fps) during processing, with the actually-used encoder (software or hardware) shown below it; cancel at any time
 
-### Einzelner Clip
+### Single clip
 
 ```bash
 cargo run --release --bin dive_overlay_cli -- \
@@ -82,9 +82,9 @@ cargo run --release --bin dive_overlay_cli -- \
   --csv-sync-mmss 0:10
 ```
 
-Danach entsteht standardmaessig: `input_overlay.mp4`
+This produces `input_overlay.mp4` by default.
 
-Fuer die Untertitel-Variante statt eingebranntem Overlay einfach `--mode subtitles` anhaengen:
+For the subtitle variant instead of a burned-in overlay, just append `--mode subtitles`:
 
 ```bash
 cargo run --release --bin dive_overlay_cli -- \
@@ -95,7 +95,7 @@ cargo run --release --bin dive_overlay_cli -- \
   --mode subtitles
 ```
 
-Fuer schnelleres Encodieren (Overlay-Modus) per Hardware-Beschleunigung, mit Fallback auf Software falls keine passende Hardware gefunden wird:
+For faster encoding (overlay mode) via hardware acceleration, with a fallback to software if no matching hardware is found:
 
 ```bash
 cargo run --release --bin dive_overlay_cli -- \
@@ -107,15 +107,15 @@ cargo run --release --bin dive_overlay_cli -- \
   --hw-accel
 ```
 
-### Mehrere Clips (mit Pausen)
+### Multiple clips (with gaps)
 
-Du gibst pro Clip einen eigenen Sync an. So bleiben auch lange Pausen zwischen Clips korrekt.
+You specify a sync point per clip, so long gaps between clips stay correct.
 
-Format pro `--clip`:
+Format per `--clip`:
 
 `video_path|video_sync_sec|csv_sync_mmss[|output_path]`
 
-Beispiel:
+Example:
 
 ```bash
 cargo run --release --bin dive_overlay_cli -- \
@@ -126,15 +126,15 @@ cargo run --release --bin dive_overlay_cli -- \
   --clip "clip3.mp4|5.0|31:20"
 ```
 
-Hinweis:
+Note:
 
-- Bei jedem Clip ist `video_sync_sec` die Stelle im jeweiligen Video.
-- `csv_sync_mmss` ist die angezeigte Tauchzeit in genau diesem Moment.
-- Wenn `output_path` fehlt, wird `<video_stem>_overlay.mp4` verwendet.
+- For each clip, `video_sync_sec` is the point in that specific video.
+- `csv_sync_mmss` is the dive time displayed at that exact moment.
+- If `output_path` is missing, `<video_stem>_overlay.mp4` is used.
 
-### Automatisches Sync (Auto-Sync)
+### Automatic sync (auto-sync)
 
-Statt jeden Clip manuell zu syncen, kann die Aufnahmezeit (MP4 `creation_time`, per `ffprobe` ausgelesen) genutzt werden: ein Basis-Clip wird manuell gesynct, alle anderen Clips werden anhand der Differenz ihrer Aufnahmezeit automatisch versetzt.
+Instead of manually syncing every clip, the recording time (MP4 `creation_time`, read via `ffprobe`) can be used: one base clip is synced manually, and all other clips are shifted automatically based on the difference in their recording time.
 
 ```bash
 cargo run --release --bin dive_overlay_cli -- \
@@ -147,34 +147,34 @@ cargo run --release --bin dive_overlay_cli -- \
   --base-csv-datetime "2025-07-05 10:00:00"
 ```
 
-Wichtig: `video_sync_sec` bleibt dabei fuer alle Clips gleich (kopiert vom Basis-Clip) — nur `csv_sync_sec` wird pro Clip anhand der Aufnahmezeit-Differenz verschoben. Das setzt voraus, dass bei jedem Clip der manuelle Sync-Punkt an derselben Video-Sekunde liegt (z. B. "die ersten Sekunden jedes Clips auf den Tauchcomputer halten").
+Important: `video_sync_sec` stays the same for all clips (copied from the base clip) — only `csv_sync_sec` is shifted per clip based on the recording-time difference. This assumes that each clip's manual sync point sits at the same video second (e.g. "point the camera at the dive computer for the first few seconds of every clip").
 
-Die CSV braucht dafuer eine Datums- und eine Uhrzeit-Spalte.
+The CSV needs a date column and a time column for this.
 
-## Synchronisation erklaert
+## Sync explained
 
-- `--video-sync-sec`: Zeitpunkt im Video (in Sekunden), an dem du den Tauchcomputer als Referenz abfilmst.
-- `--csv-sync-mmss`: Tauchzeit, die am Computer in diesem Moment angezeigt wird.
+- `--video-sync-sec`: the point in the video (in seconds) where you film the dive computer as a reference.
+- `--csv-sync-mmss`: the dive time shown on the computer at that exact moment.
 
-Beispiel:
+Example:
 
-- Bei `3.2` Sekunden Video siehst du auf dem Computer `0:10`.
-- Dann nutze `--video-sync-sec 3.2 --csv-sync-mmss 0:10`.
+- At `3.2` seconds into the video, you see `0:10` on the computer.
+- Then use `--video-sync-sec 3.2 --csv-sync-mmss 0:10`.
 
-## Optionale Parameter
+## Optional parameters
 
-- `--output out.mp4` : eigener Dateiname fuer Ausgabe
-- `--fields time,depth,temp,pressure,hr` : welche Werte eingeblendet werden
-- `--column-map time=TIME,depth=Depth` : manuelle Spaltenzuordnung, falls die Auto-Erkennung daneben liegt
-- `--clip "video|video_sync|csv_sync[|out]"` : mehrfach nutzbar fuer Multi-Clip
-- `--codec auto|avc1|H264|hevc|H265|mp4v|XVID|MJPG` : Video-Codec (wird auf den passenden ffmpeg-Encoder abgebildet, `auto`/`H264`/`avc1` -> `libx264`, `hevc`/`H265` -> `libx265`), gilt nur im Overlay-Modus
-- `--preset ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo` : Encoder-Preset fuer H264/H265 (schneller = groessere Datei bei gleicher Qualitaet), Standard `veryfast`; wird fuer andere Codecs ignoriert
-- `--hw-accel` : versucht Hardware-Beschleunigung (aktuell Intel Quick Sync) fuer H264/H265 zu nutzen und faellt automatisch auf Software zurueck, falls keine passende Hardware gefunden wird; die CLI gibt aus, welcher Encoder tatsaechlich verwendet wurde
-- `--show-graph` : zeigt ein kleines Tiefenprofil im Video, gilt nur im Overlay-Modus
-- `--mode overlay|subtitles` : `overlay` (Standard) brennt die Werte in die Pixel ein; `subtitles` schreibt sie stattdessen als weiche, im Player an/aus schaltbare Untertitelspur (Video/Audio werden verlustfrei per `-c copy` kopiert, zusaetzlich entsteht eine `.srt`-Datei neben der Ausgabe). Das Tiefenprofil (`--show-graph`) gibt es in diesem Modus nicht, da Untertitel nur Text darstellen koennen.
-- `--auto-sync`, `--base-clip`, `--base-video-sync-sec`, `--base-csv-datetime` : automatisches Sync (siehe oben)
+- `--output out.mp4` : custom output filename
+- `--fields time,depth,temp,pressure,hr` : which values are displayed
+- `--column-map time=TIME,depth=Depth` : manual column mapping, in case auto-detection gets it wrong
+- `--clip "video|video_sync|csv_sync[|out]"` : usable multiple times for multi-clip
+- `--codec auto|avc1|H264|hevc|H265|mp4v|XVID|MJPG` : video codec (mapped to the matching ffmpeg encoder, `auto`/`H264`/`avc1` -> `libx264`, `hevc`/`H265` -> `libx265`), only applies in overlay mode
+- `--preset ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo` : encoder preset for H264/H265 (faster = larger file at the same quality), default `veryfast`; ignored for other codecs
+- `--hw-accel` : tries to use hardware acceleration (currently Intel Quick Sync) for H264/H265 and falls back to software automatically if no matching hardware is found; the CLI prints which encoder was actually used
+- `--show-graph` : shows a small depth profile in the video, only applies in overlay mode
+- `--mode overlay|subtitles` : `overlay` (default) burns the values into the pixels; `subtitles` instead writes them as a soft subtitle track that can be toggled on/off in the player (video/audio are copied losslessly via `-c copy`, and a `.srt` file is additionally created next to the output). The depth profile (`--show-graph`) isn't available in this mode, since subtitles can only display text.
+- `--auto-sync`, `--base-clip`, `--base-video-sync-sec`, `--base-csv-datetime` : automatic sync (see above)
 
-Zulaessige Felder:
+Allowed fields:
 
 - `time`
 - `depth`
@@ -182,16 +182,16 @@ Zulaessige Felder:
 - `pressure`
 - `hr`
 
-Beispiel nur Zeit + Tiefe:
+Example with just time + depth:
 
 ```bash
 cargo run --release --bin dive_overlay_cli -- --csv dive.csv --video input.mp4 --video-sync-sec 0 --csv-sync-mmss 0:00 --fields time,depth
 ```
 
-## Hinweise
+## Notes
 
-- Wenn zu Beginn des Videos noch keine CSV-Zeit erreicht ist, wird nur die Tauchzeit angezeigt.
-- Fehlende CSV-Werte (z. B. Temperatur in einzelnen Zeilen) werden automatisch ausgelassen.
-- Es wird immer der letzte bekannte Messwert verwendet (stabil fuer 10s-Logging).
-- Die Original-Tonspur des Videos bleibt im Ergebnis erhalten (AAC, 192 kbit/s), sofern vorhanden.
-- Im Untertitel-Modus haengt es vom Player/Container ab, ob sich die eingebettete Spur an/aus schalten laesst — die zusaetzlich geschriebene `.srt`-Datei laesst sich notfalls auch separat laden.
+- If no CSV time has been reached yet at the start of the video, only the dive time is shown.
+- Missing CSV values (e.g. temperature in individual rows) are automatically skipped.
+- The last known measurement is always used (stable for 10s logging).
+- The video's original audio track is preserved in the result (AAC, 192 kbit/s), if present.
+- In subtitle mode, whether the embedded track can be toggled on/off depends on the player/container — the additionally written `.srt` file can also be loaded separately if needed.

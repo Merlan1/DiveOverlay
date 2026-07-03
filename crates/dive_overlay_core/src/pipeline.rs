@@ -187,7 +187,7 @@ impl EncoderInfo {
                 format!("Software: {ffmpeg_name} (Preset: {p})")
             }
             EncoderInfo::Software { ffmpeg_name, preset: None } => format!("Software: {ffmpeg_name}"),
-            EncoderInfo::Remux => "Kein Re-Encode (Untertitel-Modus)".to_string(),
+            EncoderInfo::Remux => "No re-encode (subtitle mode)".to_string(),
         }
     }
 }
@@ -319,7 +319,7 @@ fn spawn_decoder(video_path: &Path) -> Result<DecodeProcess, CoreError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| CoreError::Ffmpeg(format!("Decoder konnte nicht gestartet werden: {e}")))?;
+        .map_err(|e| CoreError::Ffmpeg(format!("Failed to start decoder: {e}")))?;
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -376,7 +376,7 @@ fn spawn_encoder(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| CoreError::Ffmpeg(format!("Encoder konnte nicht gestartet werden: {e}")))?;
+        .map_err(|e| CoreError::Ffmpeg(format!("Failed to start encoder: {e}")))?;
 
     let stdin = child.stdin.take().expect("stdin was piped");
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -417,7 +417,7 @@ pub fn process_clip(
     let info = probe_video(&job.video_path)?;
     if info.width == 0 || info.height == 0 {
         return Err(CoreError::Ffprobe(format!(
-            "Konnte Videoauflösung nicht bestimmen: {}",
+            "Could not determine video resolution: {}",
             job.video_path.display()
         )));
     }
@@ -453,11 +453,11 @@ pub fn process_clip(
         match decoder.stdout.read_exact(&mut buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(CoreError::Ffmpeg(format!("Fehler beim Lesen der Frames: {e}"))),
+            Err(e) => return Err(CoreError::Ffmpeg(format!("Error reading frames: {e}"))),
         }
 
         let mut img = RgbImage::from_raw(info.width, info.height, std::mem::take(&mut buf))
-            .ok_or_else(|| CoreError::Ffmpeg("Ungültige Frame-Größe".to_string()))?;
+            .ok_or_else(|| CoreError::Ffmpeg("Invalid frame size".to_string()))?;
 
         let video_sec = frame_idx as f64 / info.fps;
         let dive_sec = job.csv_sync_sec + (video_sec - job.video_sync_sec);
@@ -471,7 +471,7 @@ pub fn process_clip(
         if let Some(stdin) = encoder.stdin.as_mut() {
             stdin
                 .write_all(img.as_raw())
-                .map_err(|e| CoreError::Ffmpeg(format!("Fehler beim Schreiben der Frames: {e}")))?;
+                .map_err(|e| CoreError::Ffmpeg(format!("Error writing frames: {e}")))?;
         }
 
         buf = img.into_raw();
@@ -492,9 +492,9 @@ pub fn process_clip(
     let status = encoder
         .child
         .wait()
-        .map_err(|e| CoreError::Ffmpeg(format!("Encoder-Prozess fehlgeschlagen: {e}")))?;
+        .map_err(|e| CoreError::Ffmpeg(format!("Encoder process failed: {e}")))?;
     if !status.success() {
-        return Err(CoreError::Ffmpeg(format!("Encoder beendete mit Fehler: {status}")));
+        return Err(CoreError::Ffmpeg(format!("Encoder exited with error: {status}")));
     }
 
     progress(frame_idx, total_estimate.max(frame_idx));
@@ -556,7 +556,7 @@ pub fn process_clip_subtitles(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| CoreError::Ffmpeg(format!("Remux konnte nicht gestartet werden: {e}")))?;
+        .map_err(|e| CoreError::Ffmpeg(format!("Failed to start remux: {e}")))?;
 
     if let Some(stdout) = child.stdout.take() {
         spawn_stderr_drain(stdout, "ffmpeg-subtitle-stdout");
@@ -569,11 +569,11 @@ pub fn process_clip_subtitles(
     loop {
         match child
             .try_wait()
-            .map_err(|e| CoreError::Ffmpeg(format!("Fehler beim Warten auf ffmpeg: {e}")))?
+            .map_err(|e| CoreError::Ffmpeg(format!("Error waiting for ffmpeg: {e}")))?
         {
             Some(status) => {
                 if !status.success() {
-                    return Err(CoreError::Ffmpeg(format!("Remux beendete mit Fehler: {status}")));
+                    return Err(CoreError::Ffmpeg(format!("Remux exited with error: {status}")));
                 }
                 break;
             }
@@ -607,7 +607,7 @@ pub fn extract_frame_at(video_path: &Path, second: f64) -> Result<RgbImage, Core
     let info = probe_video(video_path)?;
     if info.width == 0 || info.height == 0 {
         return Err(CoreError::Ffprobe(format!(
-            "Konnte Videoauflösung nicht bestimmen: {}",
+            "Could not determine video resolution: {}",
             video_path.display()
         )));
     }
@@ -630,7 +630,7 @@ pub fn extract_frame_at(video_path: &Path, second: f64) -> Result<RgbImage, Core
         let output = cmd
             .stdin(Stdio::null())
             .output()
-            .map_err(|e| CoreError::Ffmpeg(format!("ffmpeg konnte nicht gestartet werden: {e}")))?;
+            .map_err(|e| CoreError::Ffmpeg(format!("Failed to start ffmpeg: {e}")))?;
 
         if output.stdout.len() >= frame_size {
             Ok(Some(output.stdout))
@@ -642,11 +642,11 @@ pub fn extract_frame_at(video_path: &Path, second: f64) -> Result<RgbImage, Core
     let bytes = match try_decode(true)? {
         Some(bytes) => bytes,
         None => try_decode(false)?
-            .ok_or_else(|| CoreError::Ffmpeg("Konnte keinen Frame an der Sync-Stelle lesen".to_string()))?,
+            .ok_or_else(|| CoreError::Ffmpeg("Could not read a frame at the sync point".to_string()))?,
     };
 
     RgbImage::from_raw(info.width, info.height, bytes[..frame_size].to_vec())
-        .ok_or_else(|| CoreError::Ffmpeg("Ungültige Frame-Größe".to_string()))
+        .ok_or_else(|| CoreError::Ffmpeg("Invalid frame size".to_string()))
 }
 
 #[cfg(test)]
@@ -754,7 +754,7 @@ mod tests {
             .describe(),
             "Software: mpeg4"
         );
-        assert_eq!(EncoderInfo::Remux.describe(), "Kein Re-Encode (Untertitel-Modus)");
+        assert_eq!(EncoderInfo::Remux.describe(), "No re-encode (subtitle mode)");
     }
 
     /// Opportunistic: exercises the real hardware-acceleration path when
@@ -1006,7 +1006,7 @@ mod tests {
         let srt_path = output.with_extension("srt");
         assert!(srt_path.exists());
         let srt_text = std::fs::read_to_string(&srt_path).unwrap();
-        assert!(srt_text.contains("Tiefe: 1.0 m"));
+        assert!(srt_text.contains("Depth: 1.0 m"));
 
         let info = probe_video(&output).unwrap();
         assert_eq!(info.width, 160);
