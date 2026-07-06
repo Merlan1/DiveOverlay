@@ -65,6 +65,11 @@ struct Args {
     #[arg(long)]
     show_graph: bool,
 
+    /// Linearly interpolates field values between samples instead of
+    /// carrying the last known reading forward
+    #[arg(long)]
+    interpolate: bool,
+
     /// Output mode: overlay (burned into pixels) or subtitles (soft
     /// subtitle track, toggleable on/off in the player, instead of overlay)
     #[arg(long, default_value = "overlay")]
@@ -170,6 +175,7 @@ fn main() -> Result<()> {
         hw_accel: args.hw_accel,
         show_graph: args.show_graph,
         mode,
+        interpolate: args.interpolate,
     };
     let stop_flag = Arc::new(AtomicBool::new(false));
 

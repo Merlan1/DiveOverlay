@@ -125,6 +125,7 @@ struct App {
     hw_accel: bool,
     column_map: String,
     show_graph: bool,
+    interpolate: bool,
     mode: OutputMode,
     entries: Vec<ClipEntry>,
     selected: Option<usize>,
@@ -153,6 +154,7 @@ impl Default for App {
             hw_accel: true,
             column_map: String::new(),
             show_graph: false,
+            interpolate: false,
             mode: OutputMode::Overlay,
             entries: Vec::new(),
             selected: None,
@@ -267,6 +269,7 @@ impl App {
                     self.csv_path = path.display().to_string();
                 }
             }
+            ui.checkbox(&mut self.interpolate, "Interpolate between samples");
         });
         ui.horizontal(|ui| {
             ui.label("Fields (time,depth,temp,pressure,hr):");
@@ -605,7 +608,7 @@ impl App {
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
 
         let mut frame = extract_frame_at(&entry.video_path, entry.video_sync_sec)?;
-        let lines = build_overlay_lines(&fields, &samples, &times, csv_sync_sec);
+        let lines = build_overlay_lines(&fields, &samples, &times, csv_sync_sec, self.interpolate);
         draw_overlay(&mut frame, &lines, &mut OverlayCache::new());
         if self.show_graph {
             draw_depth_graph(&mut frame, &samples, &times, csv_sync_sec, 600.0);
@@ -700,6 +703,7 @@ impl App {
         let preset = Preset::parse(&self.preset).unwrap_or_default();
         let hw_accel = self.hw_accel;
         let show_graph = self.show_graph;
+        let interpolate = self.interpolate;
         let mode = self.mode;
         let entries = self.entries.clone();
 
@@ -726,6 +730,7 @@ impl App {
                 preset,
                 hw_accel,
                 show_graph,
+                interpolate,
                 mode,
                 &cancel_flag,
                 &tx,
@@ -748,6 +753,7 @@ fn run_worker(
     preset: Preset,
     hw_accel: bool,
     show_graph: bool,
+    interpolate: bool,
     mode: OutputMode,
     cancel_flag: &Arc<AtomicBool>,
     tx: &Sender<WorkerEvent>,
@@ -800,6 +806,7 @@ fn run_worker(
             hw_accel,
             show_graph,
             mode,
+            interpolate,
         };
 
         let tx_progress = tx.clone();
@@ -920,6 +927,7 @@ mod tests {
             Preset::VeryFast,
             false,
             false,
+            false,
             OutputMode::Overlay,
             &cancel_flag,
             &tx,
@@ -968,6 +976,7 @@ mod tests {
             vec![entry],
             Codec::Auto,
             Preset::VeryFast,
+            false,
             false,
             false,
             OutputMode::Overlay,

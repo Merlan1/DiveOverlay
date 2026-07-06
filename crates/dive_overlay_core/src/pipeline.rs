@@ -286,6 +286,7 @@ pub struct ProcessingOptions {
     pub hw_accel: bool,
     pub show_graph: bool,
     pub mode: OutputMode,
+    pub interpolate: bool,
 }
 
 fn spawn_stderr_drain(mut pipe: impl Read + Send + 'static, label: &'static str) {
@@ -460,7 +461,7 @@ pub fn process_clip(
         let video_sec = frame_idx as f64 / info.fps;
         let dive_sec = job.csv_sync_sec + (video_sec - job.video_sync_sec);
 
-        let lines = build_overlay_lines(&options.fields, samples, times, dive_sec);
+        let lines = build_overlay_lines(&options.fields, samples, times, dive_sec, options.interpolate);
         draw_overlay(&mut img, &lines, &mut overlay_cache);
         if options.show_graph {
             draw_depth_graph(&mut img, samples, times, dive_sec, 600.0);
@@ -530,6 +531,7 @@ pub fn process_clip_subtitles(
         job.video_sync_sec,
         job.csv_sync_sec,
         video_duration_sec,
+        options.interpolate,
     );
 
     if let Some(parent) = job.output_path.parent() {
@@ -790,6 +792,7 @@ mod tests {
             hw_accel: true,
             show_graph: false,
             mode: OutputMode::Overlay,
+            interpolate: false,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -850,6 +853,7 @@ mod tests {
             hw_accel: false,
             show_graph: true,
             mode: OutputMode::Overlay,
+            interpolate: false,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -909,6 +913,7 @@ mod tests {
             hw_accel: false,
             show_graph: false,
             mode: OutputMode::Overlay,
+            interpolate: false,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_for_progress = stop_flag.clone();
@@ -954,6 +959,7 @@ mod tests {
             hw_accel: false,
             show_graph: false,
             mode: OutputMode::Overlay,
+            interpolate: false,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -993,6 +999,7 @@ mod tests {
             hw_accel: false,
             show_graph: false,
             mode: OutputMode::Subtitles,
+            interpolate: false,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 

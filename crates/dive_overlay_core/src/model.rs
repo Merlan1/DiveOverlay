@@ -55,16 +55,37 @@ impl Field {
     }
 }
 
+/// Raw numeric measurement of `sample` for `field`, or `None` if that
+/// sample doesn't have it (or for `Field::Time`, which has no per-sample
+/// value). Shared by `value_for_field` and the interpolated lookup in
+/// `overlay.rs`, so both paths read the same underlying number.
+pub fn field_raw_value(sample: &DiveSample, field: Field) -> Option<f64> {
+    match field {
+        Field::Time => None,
+        Field::Depth => sample.depth_m,
+        Field::Temp => sample.temp_c,
+        Field::Pressure => sample.pressure_bar,
+        Field::Hr => sample.heart_rate,
+    }
+}
+
+/// Formats an already-resolved numeric `value` for `field` display. Split
+/// out from `value_for_field` so an interpolated (not-directly-logged)
+/// value can be formatted identically to a carried-forward one.
+pub fn format_field_value(field: Field, value: f64) -> Option<String> {
+    match field {
+        Field::Time => None,
+        Field::Depth => Some(format!("Depth: {:.1} m", value)),
+        Field::Temp => Some(format!("Temp: {:.1} C", value)),
+        Field::Pressure => Some(format!("Pressure: {:.0} bar", value)),
+        Field::Hr => Some(format!("HR: {:.0} bpm", value)),
+    }
+}
+
 /// Formats a single field's value for display. Returns `None` when the
 /// sample lacks that measurement, or for `Field::Time` (whose display line
 /// is built by the caller from the dive-elapsed-second, not from a
 /// per-sample value).
 pub fn value_for_field(sample: &DiveSample, field: Field) -> Option<String> {
-    match field {
-        Field::Time => None,
-        Field::Depth => sample.depth_m.map(|d| format!("Depth: {:.1} m", d)),
-        Field::Temp => sample.temp_c.map(|t| format!("Temp: {:.1} C", t)),
-        Field::Pressure => sample.pressure_bar.map(|p| format!("Pressure: {:.0} bar", p)),
-        Field::Hr => sample.heart_rate.map(|h| format!("HR: {:.0} bpm", h)),
-    }
+    field_raw_value(sample, field).and_then(|v| format_field_value(field, v))
 }

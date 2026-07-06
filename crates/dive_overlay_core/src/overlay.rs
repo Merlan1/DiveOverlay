@@ -7,7 +7,7 @@ use imageproc::rect::Rect;
 
 use crate::csv_data::format_duration;
 use crate::lookup::choose_sample_index;
-use crate::model::{value_for_field, DiveSample, Field};
+use crate::model::{field_raw_value, format_field_value, value_for_field, DiveSample, Field};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 
@@ -44,11 +44,19 @@ fn blend_rect_alpha(img: &mut RgbImage, x: i32, y: i32, w: u32, h: u32, color: R
 }
 
 /// Builds the display lines for the info box at `dive_sec`: the elapsed dive
-/// time (if requested) plus the latest known value for every other
-/// requested field, falling back to "No data" if nothing is available yet.
-/// Centralizing this (the original duplicated it between the CLI's frame
-/// loop and the GUI's preview code) keeps CLI/GUI rendering identical.
-pub fn build_overlay_lines(fields: &[Field], samples: &[DiveSample], times: &[f64], dive_sec: f64) -> Vec<String> {
+/// time (if requested) plus, for every other requested field, either the
+/// latest known value (carried forward) or a value linearly interpolated
+/// between the nearest bracketing samples (if `interpolate` is set),
+/// falling back to "No data" if nothing is available yet. Centralizing this
+/// (the original duplicated it between the CLI's frame loop and the GUI's
+/// preview code) keeps CLI/GUI rendering identical.
+pub fn build_overlay_lines(
+    fields: &[Field],
+    samples: &[DiveSample],
+    times: &[f64],
+    dive_sec: f64,
+    interpolate: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
     if fields.contains(&Field::Time) {
         lines.push(format!("Dive time: {}", format_duration(dive_sec)));
@@ -59,7 +67,12 @@ pub fn build_overlay_lines(fields: &[Field], samples: &[DiveSample], times: &[f6
             if field == Field::Time {
                 continue;
             }
-            if let Some(value) = last_known_value(&samples[..=idx], field) {
+            let value = if interpolate {
+                interpolated_value(samples, times, dive_sec, idx, field)
+            } else {
+                last_known_value(&samples[..=idx], field)
+            };
+            if let Some(value) = value {
                 lines.push(value);
             }
         }
@@ -78,6 +91,30 @@ fn last_known_value(samples_up_to_now: &[DiveSample], field: Field) -> Option<St
         .iter()
         .rev()
         .find_map(|sample| value_for_field(sample, field))
+}
+
+/// Linearly interpolates `field` at `dive_sec` between the nearest samples
+/// at-or-before and after `idx` that actually carry this field (skipping
+/// over sparse gaps the same way `last_known_value` does). Never
+/// extrapolates: before the first logged value there's nothing to show, and
+/// after the last one this carries it forward, same as the non-interpolated
+/// path.
+fn interpolated_value(samples: &[DiveSample], times: &[f64], dive_sec: f64, idx: usize, field: Field) -> Option<String> {
+    // TODO: replace linear interpolation with a Fourier-transform-based
+    // reconstruction for smoother inter-sample estimates. Note: samples are
+    // sparse and irregularly spaced, so a spline/cubic fit may suit this
+    // data better than FFT-based reconstruction — worth evaluating both.
+    let before = (0..=idx).rev().find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)))?;
+    let after = (idx + 1..times.len()).find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)));
+
+    let value = match after {
+        Some((after_t, after_val)) if after_t > before.0 => {
+            let frac = (dive_sec - before.0) / (after_t - before.0);
+            before.1 + frac * (after_val - before.1)
+        }
+        _ => before.1,
+    };
+    format_field_value(field, value)
 }
 
 /// Caches the rendered info-box tile (translucent background + text) across
@@ -276,7 +313,7 @@ mod tests {
 
     #[test]
     fn build_overlay_lines_falls_back_to_no_data() {
-        let lines = build_overlay_lines(&[Field::Depth], &[], &[], 5.0);
+        let lines = build_overlay_lines(&[Field::Depth], &[], &[], 5.0, false);
         assert_eq!(lines, vec!["No data".to_string()]);
     }
 
@@ -284,7 +321,7 @@ mod tests {
     fn build_overlay_lines_includes_time_and_depth() {
         let samples = vec![sample(0.0, 1.5)];
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
-        let lines = build_overlay_lines(&[Field::Time, Field::Depth], &samples, &times, 10.0);
+        let lines = build_overlay_lines(&[Field::Time, Field::Depth], &samples, &times, 10.0, false);
         assert_eq!(lines[0], "Dive time: 00:10");
         assert_eq!(lines[1], "Depth: 1.5 m");
     }
@@ -296,8 +333,30 @@ mod tests {
         let samples = vec![with_temp, sample(10.0, 2.0), sample(20.0, 3.0)];
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
 
-        let lines = build_overlay_lines(&[Field::Temp], &samples, &times, 20.0);
+        let lines = build_overlay_lines(&[Field::Temp], &samples, &times, 20.0, false);
         assert_eq!(lines, vec!["Temp: 18.0 C".to_string()]);
+    }
+
+    #[test]
+    fn build_overlay_lines_interpolates_between_samples() {
+        let samples = vec![sample(0.0, 1.0), sample(10.0, 2.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+
+        let lines = build_overlay_lines(&[Field::Depth], &samples, &times, 5.0, true);
+        assert_eq!(lines, vec!["Depth: 1.5 m".to_string()]);
+    }
+
+    #[test]
+    fn build_overlay_lines_interpolation_skips_sparse_gaps_and_carries_last_value() {
+        let mut with_temp = sample(0.0, 1.0);
+        with_temp.temp_c = Some(10.0);
+        let samples = vec![with_temp, sample(10.0, 2.0), sample(20.0, 3.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+
+        // No later temperature reading to interpolate towards, so this
+        // still carries the last known value forward instead of extrapolating.
+        let lines = build_overlay_lines(&[Field::Temp], &samples, &times, 20.0, true);
+        assert_eq!(lines, vec!["Temp: 10.0 C".to_string()]);
     }
 
     #[test]
