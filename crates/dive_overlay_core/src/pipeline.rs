@@ -120,9 +120,9 @@ impl Default for Preset {
 /// hardware/driver is actually present on the running machine -- see
 /// `probe_hw_encoder`.
 ///
-/// `Nvenc`/`Amf` are unused for now (see `ENABLED_HW_CANDIDATES`) -- allowed
-/// dead code rather than deleted, since the mapping in
-/// `ffmpeg_encoder_name` below is already correct and ready to enable.
+/// `Amf` is unused for now (see `ENABLED_HW_CANDIDATES`) -- allowed dead code
+/// rather than deleted, since the mapping in `ffmpeg_encoder_name` below is
+/// already correct and ready to enable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum HwEncoder {
@@ -157,14 +157,12 @@ impl HwEncoder {
 }
 
 /// Hardware encoders auto-detection will actually probe/try, in priority
-/// order. NVENC and AMF are fully implemented above (name mapping) and
-/// below (`probe_hw_encoder` works identically for all three backends),
-/// but are deliberately left out of this list until verified against real
-/// Nvidia/AMD hardware -- the machine this was developed on only has an
-/// Intel iGPU, so only the QSV path has been exercised end to end. Add
-/// `HwEncoder::Nvenc`/`HwEncoder::Amf` here once confirmed on the
-/// corresponding hardware.
-const ENABLED_HW_CANDIDATES: &[HwEncoder] = &[HwEncoder::Qsv];
+/// order. NVENC has been confirmed end to end on real Nvidia hardware
+/// (GeForce RTX 2070). AMF is fully implemented above (name mapping) and
+/// below (`probe_hw_encoder` works identically for all three backends), but
+/// is deliberately left out of this list until verified against real AMD
+/// hardware. Add `HwEncoder::Amf` here once confirmed on that hardware.
+const ENABLED_HW_CANDIDATES: &[HwEncoder] = &[HwEncoder::Qsv, HwEncoder::Nvenc];
 
 /// Describes which concrete ffmpeg video encoder ended up being used for a
 /// job. Silently falling back from a requested hardware encoder to
