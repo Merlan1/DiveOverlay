@@ -93,28 +93,61 @@ fn last_known_value(samples_up_to_now: &[DiveSample], field: Field) -> Option<St
         .find_map(|sample| value_for_field(sample, field))
 }
 
-/// Linearly interpolates `field` at `dive_sec` between the nearest samples
-/// at-or-before and after `idx` that actually carry this field (skipping
-/// over sparse gaps the same way `last_known_value` does). Never
+/// Interpolates `field` at `dive_sec` between the nearest samples at-or-before
+/// and after `idx` that actually carry this field (skipping over sparse gaps
+/// the same way `last_known_value` does), using a cubic Hermite spline so the
+/// curve isn't kinked at each sample like linear interpolation. Never
 /// extrapolates: before the first logged value there's nothing to show, and
 /// after the last one this carries it forward, same as the non-interpolated
 /// path.
 fn interpolated_value(samples: &[DiveSample], times: &[f64], dive_sec: f64, idx: usize, field: Field) -> Option<String> {
-    // TODO: replace linear interpolation with a Fourier-transform-based
-    // reconstruction for smoother inter-sample estimates. Note: samples are
-    // sparse and irregularly spaced, so a spline/cubic fit may suit this
-    // data better than FFT-based reconstruction — worth evaluating both.
-    let before = (0..=idx).rev().find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)))?;
-    let after = (idx + 1..times.len()).find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)));
+    let before_idx = (0..=idx).rev().find(|&j| field_raw_value(&samples[j], field).is_some())?;
+    let before = (times[before_idx], field_raw_value(&samples[before_idx], field).unwrap());
+    let after_idx = (idx + 1..times.len()).find(|&j| field_raw_value(&samples[j], field).is_some());
 
-    let value = match after {
-        Some((after_t, after_val)) if after_t > before.0 => {
-            let frac = (dive_sec - before.0) / (after_t - before.0);
-            before.1 + frac * (after_val - before.1)
+    let value = match after_idx {
+        Some(after_idx) if times[after_idx] > before.0 => {
+            let after = (times[after_idx], field_raw_value(&samples[after_idx], field).unwrap());
+            let prev = (0..before_idx).rev().find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)));
+            let next = (after_idx + 1..times.len()).find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)));
+            cubic_hermite(dive_sec, prev, before, after, next)
         }
         _ => before.1,
     };
     format_field_value(field, value)
+}
+
+/// Cubic Hermite interpolation between `p0` and `p1` at time `t`, with
+/// tangents estimated Catmull-Rom style from each endpoint's other neighbor
+/// (`prev`/`next`) over the *actual* elapsed time to that neighbor -- this
+/// keeps tangents sane when samples are irregularly spaced, unlike a
+/// standard uniform-spacing Catmull-Rom spline. Falls back to the `p0`-`p1`
+/// secant slope at whichever end has no neighbor (start/end of the series
+/// for this field), which degrades to plain linear interpolation there.
+fn cubic_hermite(t: f64, prev: Option<(f64, f64)>, p0: (f64, f64), p1: (f64, f64), next: Option<(f64, f64)>) -> f64 {
+    let (t0, v0) = p0;
+    let (t1, v1) = p1;
+    let dt = t1 - t0;
+    let secant = (v1 - v0) / dt;
+
+    let m0 = match prev {
+        Some((tp, vp)) if t1 > tp => (v1 - vp) / (t1 - tp),
+        _ => secant,
+    };
+    let m1 = match next {
+        Some((tn, vn)) if tn > t0 => (vn - v0) / (tn - t0),
+        _ => secant,
+    };
+
+    let s = (t - t0) / dt;
+    let s2 = s * s;
+    let s3 = s2 * s;
+    let h00 = 2.0 * s3 - 3.0 * s2 + 1.0;
+    let h10 = s3 - 2.0 * s2 + s;
+    let h01 = -2.0 * s3 + 3.0 * s2;
+    let h11 = s3 - s2;
+
+    h00 * v0 + h10 * dt * m0 + h01 * v1 + h11 * dt * m1
 }
 
 /// Caches the rendered info-box tile (translucent background + text) across
@@ -357,6 +390,37 @@ mod tests {
         // still carries the last known value forward instead of extrapolating.
         let lines = build_overlay_lines(&[Field::Temp], &samples, &times, 20.0, true);
         assert_eq!(lines, vec!["Temp: 10.0 C".to_string()]);
+    }
+
+    #[test]
+    fn cubic_hermite_matches_linear_when_tangents_equal_secant() {
+        // Straight line through all four points: both endpoint tangents
+        // equal the segment secant, so the cubic must reduce to the linear
+        // value exactly, same as it does with no prev/next at all.
+        let value = cubic_hermite(15.0, Some((0.0, 0.0)), (10.0, 1.0), (20.0, 2.0), Some((30.0, 3.0)));
+        assert!((value - 1.5).abs() < 1e-9, "expected 1.5, got {value}");
+    }
+
+    #[test]
+    fn cubic_hermite_curves_toward_neighbor_slope() {
+        // p0's incoming slope (0..20, via prev) is shallower than the
+        // segment's own secant (0..10 -> 10), so the curve should bow below
+        // the segment's linear midpoint (5.0) rather than sitting on it.
+        let value = cubic_hermite(15.0, Some((0.0, 0.0)), (10.0, 0.0), (20.0, 10.0), None);
+        assert!(value < 5.0, "expected the fitted curve to diverge from the linear midpoint, got {value}");
+    }
+
+    #[test]
+    fn build_overlay_lines_interpolation_curves_through_neighbors() {
+        // No sample after 20.0, so p1's tangent falls back to the segment
+        // secant (1.0/sec) while p0's tangent is pulled shallower by the
+        // flatter 0..20 run leading into it -- the cubic fit lands well
+        // below the segment's own linear midpoint (5.0).
+        let samples = vec![sample(0.0, 0.0), sample(10.0, 0.0), sample(20.0, 10.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+
+        let lines = build_overlay_lines(&[Field::Depth], &samples, &times, 15.0, true);
+        assert_eq!(lines, vec!["Depth: 4.4 m".to_string()]);
     }
 
     #[test]
