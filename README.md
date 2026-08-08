@@ -1,8 +1,6 @@
-# Dive Data Overlay (Rust)
+# Dive Data Overlay
 
 Overlays dive-computer CSV telemetry (depth, temperature, pressure, heart rate, dive time) onto video. Supports multiple clips with gaps, per-clip sync points, and automatic sync via each MP4's recording time.
-
-A Rust workspace that shells out to `ffmpeg`/`ffprobe` (no OpenCV/libav linking).
 
 ![Overlay example](screenshots/Preview.png)
 
@@ -43,7 +41,7 @@ Column names are recognized flexibly, e.g. `sample time (min)`, `sample depth (m
 cargo run --release --bin dive_overlay_gui
 ```
 
-Select a CSV (with an optional "Interpolate between samples" toggle next to Browse), set fields, choose a mode and codec/preset/hardware acceleration, add clips, preview and fine-tune sync, then start processing. Progress (%, fps, active encoder) is shown live and can be cancelled at any time.
+Select a CSV , set fields, choose a mode and codec/preset/hardware acceleration, add clips, preview and fine-tune sync, then start processing.
 
 ### CLI — single clip
 
@@ -109,6 +107,5 @@ Allowed fields: `time`, `depth`, `temp`, `pressure`, `hr`.
 
 - If no CSV time has been reached yet at the start of the video, only the dive time is shown.
 - Missing CSV values (e.g. temperature in individual rows) are skipped automatically.
-- By default the last known measurement is carried forward (stable for typical 10s logging intervals); `--interpolate` linearly interpolates between samples instead.
-- The original audio track is preserved (AAC, 192 kbit/s), if present.
-- In subtitle mode, whether the embedded track can be toggled on/off depends on the player/container — the `.srt` sidecar can also be loaded separately.
+- By default the last known measurement is carried forward.
+- The original audio track is preserved , if present.
