@@ -61,10 +61,11 @@ impl Codec {
 /// ffmpeg's `-preset` value. Faster presets trade off compression efficiency
 /// (larger output for the same quality) for encoding speed; slower ones do
 /// the opposite. Ignored for codecs where `Codec::supports_preset` is false.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Preset {
     UltraFast,
     SuperFast,
+    #[default]
     VeryFast,
     Faster,
     Fast,
@@ -105,12 +106,6 @@ impl Preset {
             Preset::VerySlow => "veryslow",
             Preset::Placebo => "placebo",
         }
-    }
-}
-
-impl Default for Preset {
-    fn default() -> Self {
-        Preset::VeryFast
     }
 }
 
@@ -339,6 +334,7 @@ struct EncodeProcess {
 /// (not `-nostdin`) belongs here since stdin carries real data -- `-y`
 /// alone prevents ffmpeg from trying to read an interactive overwrite
 /// confirmation off that same pipe.
+#[allow(clippy::too_many_arguments)]
 fn spawn_encoder(
     output_path: &Path,
     original_input: &Path,
@@ -475,7 +471,7 @@ pub fn process_clip(
 
         buf = img.into_raw();
         frame_idx += 1;
-        if frame_idx % 10 == 0 {
+        if frame_idx.is_multiple_of(10) {
             progress(frame_idx, total_estimate);
         }
     }

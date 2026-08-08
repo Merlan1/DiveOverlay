@@ -556,7 +556,7 @@ impl App {
 
                 if let Some(preview) = &self.preview {
                     let available = ui.available_size();
-                    let scale = (available.x / preview.size.x).min(1.0).max(0.05);
+                    let scale = (available.x / preview.size.x).clamp(0.05, 1.0);
                     let display_size = preview.size * scale;
                     let sized = egui::load::SizedTexture::new(preview.texture.id(), display_size);
                     ui.add(egui::Image::from_texture(sized));
