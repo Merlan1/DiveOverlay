@@ -308,7 +308,16 @@ fn spawn_decoder(video_path: &Path) -> Result<DecodeProcess, CoreError> {
     let mut child = Command::new("ffmpeg")
         .args(["-nostdin", "-v", "error", "-i"])
         .arg(video_path)
-        .args(["-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "-vsync", "0", "pipe:1"])
+        .args([
+            "-an",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-fps_mode",
+            "passthrough",
+            "pipe:1",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
