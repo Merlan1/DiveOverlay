@@ -65,8 +65,8 @@ struct Args {
     #[arg(long)]
     show_graph: bool,
 
-    /// Linearly interpolates field values between samples instead of
-    /// carrying the last known reading forward
+    /// Smoothly interpolates field values between samples (cubic spline)
+    /// instead of carrying the last known reading forward
     #[arg(long)]
     interpolate: bool,
 
@@ -156,7 +156,7 @@ fn main() -> Result<()> {
             base_video_sync_sec: args.base_video_sync_sec,
             base_csv_datetime: &args.base_csv_datetime,
         };
-        compute_auto_sync(&args.csv, &mut jobs, &params)?;
+        compute_auto_sync(&args.csv, &column_map, &mut jobs, &params)?;
     }
 
     let mode = OutputMode::parse(&args.mode)
@@ -168,9 +168,16 @@ fn main() -> Result<()> {
         )
     })?;
 
+    let codec = Codec::parse(&args.codec).ok_or_else(|| {
+        anyhow!(
+            "Invalid --codec value: {} (expected: auto, avc1, H264, hevc, H265, mp4v, XVID, MJPG)",
+            args.codec
+        )
+    })?;
+
     let options = ProcessingOptions {
         fields,
-        codec: Codec::parse(&args.codec),
+        codec,
         preset,
         hw_accel: args.hw_accel,
         show_graph: args.show_graph,

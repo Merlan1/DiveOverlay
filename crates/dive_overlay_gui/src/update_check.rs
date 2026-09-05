@@ -25,9 +25,12 @@ pub fn spawn_check(tx: std::sync::mpsc::Sender<UpdateStatus>, ctx: egui::Context
 
 fn check() -> UpdateStatus {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let response = ureq::get(&url)
-        .set("User-Agent", "DiveOverlay-GUI")
-        .call();
+    // Bounded so a stalled connection can't keep the background thread (and
+    // its egui context handle) alive for the app's whole lifetime.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let response = agent.get(&url).set("User-Agent", "DiveOverlay-GUI").call();
 
     let release: ReleaseResponse = match response {
         Ok(resp) => match resp.into_json() {
