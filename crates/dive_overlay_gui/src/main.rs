@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use dive_overlay_core::csv_data::{
-    format_duration, load_samples, parse_column_map, parse_duration_to_seconds, parse_fields,
+    format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds, parse_fields,
 };
 use dive_overlay_core::ffprobe::probe_video;
 use dive_overlay_core::model::Field;
@@ -50,7 +50,9 @@ enum WorkerEvent {
     Progress(f32),
     Fps(f64),
     Encoder(String),
-    Done(Result<(), String>),
+    /// `Ok(true)` = every clip finished, `Ok(false)` = stopped early via the
+    /// cancel flag (the partial output is still a valid file), `Err` = failed.
+    Done(Result<bool, String>),
 }
 
 struct ClipDialogState {
@@ -222,9 +224,13 @@ impl App {
                 let _ = handle.join();
             }
             match result {
-                Ok(()) => {
+                Ok(true) => {
                     self.status = "Done".to_string();
                     self.progress = 100.0;
+                }
+                Ok(false) => {
+                    self.status = "Cancelled".to_string();
+                    self.fps = 0.0;
                 }
                 Err(e) => {
                     self.status = "Error".to_string();
@@ -307,7 +313,7 @@ impl App {
                         }
                     });
 
-                let hw_applies = Codec::parse(&self.codec).supports_preset();
+                let hw_applies = Codec::parse(&self.codec).is_some_and(Codec::supports_preset);
                 ui.add_enabled_ui(hw_applies, |ui| {
                     ui.label("Preset:");
                     egui::ComboBox::from_id_salt("preset")
@@ -325,7 +331,7 @@ impl App {
         });
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!subtitle_mode, |ui| {
-                let hw_applies = Codec::parse(&self.codec).supports_preset();
+                let hw_applies = Codec::parse(&self.codec).is_some_and(Codec::supports_preset);
                 ui.add_enabled_ui(hw_applies, |ui| {
                     ui.checkbox(&mut self.hw_accel, "Hardware acceleration (if available)");
                 });
@@ -354,6 +360,17 @@ impl App {
                 if let Some(idx) = self.selected {
                     self.entries.remove(idx);
                     self.selected = None;
+                    // Keep an open preview pointing at the same clip (or close
+                    // it if that clip is the one just removed) -- otherwise its
+                    // +-buttons would silently edit whichever entry shifted
+                    // into the removed slot.
+                    if let Some(preview) = &mut self.preview {
+                        if preview.clip_index == idx {
+                            self.preview = None;
+                        } else if preview.clip_index > idx {
+                            preview.clip_index -= 1;
+                        }
+                    }
                 }
             }
             if ui.button("Sync preview").clicked() {
@@ -572,7 +589,9 @@ impl App {
         if let Some(delta) = adjust {
             if let Some(entry) = self.entries.get_mut(clip_index) {
                 let current = parse_duration_to_seconds(&entry.csv_sync_mmss).unwrap_or(0.0);
-                entry.csv_sync_mmss = format_duration((current + delta).max(0.0));
+                // Must keep fractional seconds: the whole-second formatter
+                // would turn "-0.5 s" into a no-op and "+0.5 s" into +1 s.
+                entry.csv_sync_mmss = format_duration_precise((current + delta).max(0.0));
             }
             self.render_preview(clip_index, ctx);
         } else if reload {
@@ -699,7 +718,13 @@ impl App {
             }
         }
 
-        let codec = Codec::parse(&self.codec);
+        let codec = match Codec::parse(&self.codec) {
+            Some(c) => c,
+            None => {
+                self.log_lines.push(format!("Error: unknown codec: {}", self.codec));
+                return;
+            }
+        };
         let preset = Preset::parse(&self.preset).unwrap_or_default();
         let hw_accel = self.hw_accel;
         let show_graph = self.show_graph;
@@ -758,7 +783,7 @@ fn run_worker(
     cancel_flag: &Arc<AtomicBool>,
     tx: &Sender<WorkerEvent>,
     ctx: &egui::Context,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let samples = load_samples(&csv_path, &column_map).map_err(|e| e.to_string())?;
     let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
     let total = entries.len();
@@ -850,7 +875,7 @@ fn run_worker(
 
         if !completed {
             let _ = tx.send(WorkerEvent::Log("Cancelled: processing stopped.".to_string()));
-            return Ok(());
+            return Ok(false);
         }
 
         base_done_frames += clip_total;
@@ -864,7 +889,7 @@ fn run_worker(
         )));
     }
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -934,7 +959,7 @@ mod tests {
             &ctx,
         );
 
-        assert!(result.is_ok(), "run_worker failed: {result:?}");
+        assert_eq!(result, Ok(true), "run_worker failed: {result:?}");
         assert!(output.exists());
 
         let events: Vec<WorkerEvent> = rx.try_iter().collect();
@@ -985,7 +1010,7 @@ mod tests {
             &ctx,
         );
 
-        assert!(result.is_ok());
+        assert_eq!(result, Ok(false), "a cancelled run must not report success");
         let events: Vec<WorkerEvent> = rx.try_iter().collect();
         assert!(events
             .iter()

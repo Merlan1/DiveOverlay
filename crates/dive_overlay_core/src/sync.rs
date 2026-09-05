@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -84,7 +85,16 @@ pub struct AutoSyncParams<'a> {
 /// original assumes every clip's manual sync point sits at the same video
 /// second (e.g. "point the camera at the dive computer for the first few
 /// seconds of every clip").
-pub fn compute_auto_sync(csv_path: &Path, jobs: &mut [ClipJob], params: &AutoSyncParams) -> Result<(), CoreError> {
+///
+/// `column_map` supplies the `date=`/`clock=` overrides from `--column-map`
+/// (and `time=`, used to keep the elapsed-time column out of the clock
+/// heuristic); pass an empty map for pure auto-detection.
+pub fn compute_auto_sync(
+    csv_path: &Path,
+    column_map: &HashMap<String, String>,
+    jobs: &mut [ClipJob],
+    params: &AutoSyncParams,
+) -> Result<(), CoreError> {
     let base_clip_resolved = params
         .base_clip
         .canonicalize()
@@ -101,12 +111,13 @@ pub fn compute_auto_sync(csv_path: &Path, jobs: &mut [ClipJob], params: &AutoSyn
     let base_video_start = get_video_creation_time_utc(&base_job_video_path)?;
     let base_csv_dt = parse_datetime_text(params.base_csv_datetime)?;
 
-    let (date_col, clock_col) = read_csv_datetime_columns(csv_path)?;
+    let (date_col, clock_col) = read_csv_datetime_columns(csv_path, column_map)?;
     let (date_col, clock_col) = match (date_col, clock_col) {
         (Some(d), Some(c)) => (d, c),
         _ => {
             return Err(CoreError::Other(
-                "CSV needs date and time columns for auto-sync".to_string(),
+                "CSV needs date and time columns for auto-sync (use --column-map date=...,clock=... to name them)"
+                    .to_string(),
             ))
         }
     };
@@ -216,7 +227,7 @@ mod tests {
             base_csv_datetime: "2025-07-05 10:00:00",
         };
 
-        compute_auto_sync(&csv_path, &mut jobs, &params).unwrap();
+        compute_auto_sync(&csv_path, &HashMap::new(), &mut jobs, &params).unwrap();
 
         // CSV's first row is 09:58:00; base sync point is 10:00:00 -> +120s offset.
         assert!((jobs[0].csv_sync_sec - 120.0).abs() < 1.0);
@@ -225,5 +236,45 @@ mod tests {
         // video_sync_sec must be identical across jobs (copied from base), per original behavior.
         assert_eq!(jobs[0].video_sync_sec, 2.0);
         assert_eq!(jobs[1].video_sync_sec, 2.0);
+    }
+
+    #[test]
+    fn auto_sync_uses_column_map_for_date_and_clock_columns() {
+        let dir = make_dir("auto_sync_column_map");
+        let base_clip = synth_clip_with_creation_time(&dir, "base.mp4", "2025-07-05T10:00:00Z");
+
+        // Header names no heuristic would find.
+        let csv_path = dir.join("dive.csv");
+        std::fs::write(
+            &csv_path,
+            "d,c,sample time (min),sample depth (m)\n2025-07-05,09:58:00,0:00,1.0\n",
+        )
+        .unwrap();
+
+        let make_jobs = || {
+            vec![ClipJob {
+                video_path: base_clip.clone(),
+                output_path: PathBuf::from("base_overlay.mp4"),
+                video_sync_sec: 0.0,
+                csv_sync_sec: 0.0,
+                video_start_utc: None,
+            }]
+        };
+        let params = AutoSyncParams {
+            base_clip: &base_clip,
+            base_video_sync_sec: 2.0,
+            base_csv_datetime: "2025-07-05 10:00:00",
+        };
+
+        let mut jobs = make_jobs();
+        let err = compute_auto_sync(&csv_path, &HashMap::new(), &mut jobs, &params).unwrap_err();
+        assert!(err.to_string().contains("date and time columns"), "unexpected error: {err}");
+
+        let mut map = HashMap::new();
+        map.insert("date".to_string(), "d".to_string());
+        map.insert("clock".to_string(), "c".to_string());
+        let mut jobs = make_jobs();
+        compute_auto_sync(&csv_path, &map, &mut jobs, &params).unwrap();
+        assert!((jobs[0].csv_sync_sec - 120.0).abs() < 1.0);
     }
 }

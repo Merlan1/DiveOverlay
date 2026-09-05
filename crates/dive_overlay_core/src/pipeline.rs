@@ -1,9 +1,9 @@
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use image::RgbImage;
 
@@ -24,14 +24,17 @@ pub enum Codec {
 }
 
 impl Codec {
-    pub fn parse(s: &str) -> Codec {
+    /// Returns `None` for unrecognized names so callers can report a typo
+    /// instead of silently encoding with the default (libx264).
+    pub fn parse(s: &str) -> Option<Codec> {
         match s.trim().to_lowercase().as_str() {
-            "avc1" | "h264" => Codec::H264,
-            "hevc" | "h265" | "x265" => Codec::H265,
-            "mp4v" => Codec::Mpeg4,
-            "xvid" => Codec::Xvid,
-            "mjpg" | "mjpeg" => Codec::Mjpeg,
-            _ => Codec::Auto,
+            "" | "auto" => Some(Codec::Auto),
+            "avc1" | "h264" => Some(Codec::H264),
+            "hevc" | "h265" | "x265" => Some(Codec::H265),
+            "mp4v" => Some(Codec::Mpeg4),
+            "xvid" => Some(Codec::Xvid),
+            "mjpg" | "mjpeg" => Some(Codec::Mjpeg),
+            _ => None,
         }
     }
 
@@ -284,40 +287,99 @@ pub struct ProcessingOptions {
     pub interpolate: bool,
 }
 
-fn spawn_stderr_drain(mut pipe: impl Read + Send + 'static, label: &'static str) {
+/// Reads an ffmpeg child's stderr to EOF on a background thread (so the
+/// child never blocks on a full stderr pipe) and hands the text back via
+/// the join handle, so it can be attached to the error message if the
+/// process fails -- "exit code: 1" on its own tells a GUI user nothing.
+fn spawn_stderr_capture(mut pipe: impl Read + Send + 'static) -> JoinHandle<String> {
     thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = pipe.read_to_end(&mut buf);
-        let text = String::from_utf8_lossy(&buf);
-        if !text.trim().is_empty() {
-            eprintln!("[{label}] {text}");
-        }
-    });
+        String::from_utf8_lossy(&buf).trim().to_string()
+    })
+}
+
+/// Collects a captured stderr. On success any leftover text (warnings) is
+/// echoed to our own stderr as before; on failure it is returned so the
+/// caller can fold it into the `CoreError` instead.
+fn finish_stderr(handle: JoinHandle<String>, label: &str, succeeded: bool) -> String {
+    let text = handle.join().unwrap_or_default();
+    if succeeded && !text.is_empty() {
+        eprintln!("[{label}] {text}");
+    }
+    text
+}
+
+fn ffmpeg_failure(what: &str, status: std::process::ExitStatus, stderr_text: &str) -> CoreError {
+    if stderr_text.is_empty() {
+        CoreError::Ffmpeg(format!("{what} exited with error: {status}"))
+    } else {
+        CoreError::Ffmpeg(format!("{what} exited with error: {status}\n{stderr_text}"))
+    }
+}
+
+/// Best-effort absolute form of `path` for equality comparison: the real
+/// canonical path if it exists, otherwise the canonical parent joined with
+/// the file name (the output file usually doesn't exist yet).
+fn resolved_for_compare(path: &Path) -> PathBuf {
+    if let Ok(p) = path.canonicalize() {
+        return p;
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let parent = parent.canonicalize().unwrap_or(parent);
+    match path.file_name() {
+        Some(name) => parent.join(name),
+        None => path.to_path_buf(),
+    }
+}
+
+/// ffmpeg refuses an output whose path string is byte-identical to an
+/// input, but a differently spelled path (relative vs absolute, other case
+/// on Windows) slips through and the encoder then truncates the very file
+/// the decoder is still reading. Catch that before spawning anything.
+fn ensure_output_differs_from_input(video_path: &Path, output_path: &Path) -> Result<(), CoreError> {
+    let a = resolved_for_compare(video_path);
+    let b = resolved_for_compare(output_path);
+    let same = if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    };
+    if same {
+        return Err(CoreError::Other(format!(
+            "Output path must differ from the input video: {}",
+            output_path.display()
+        )));
+    }
+    Ok(())
 }
 
 struct DecodeProcess {
     child: Child,
     stdout: ChildStdout,
+    stderr: JoinHandle<String>,
 }
 
 /// Spawns an ffmpeg process that decodes `video_path` to a raw rgb24 stream
-/// on stdout. `-nostdin` is safe here because this process's stdin is
-/// unused -- do not use it on the encoder, whose stdin carries real frame
-/// data.
-fn spawn_decoder(video_path: &Path) -> Result<DecodeProcess, CoreError> {
+/// on stdout at a constant `fps`. Constant-frame-rate output is essential:
+/// the pipeline derives each frame's timestamp as `frame_idx / fps` and the
+/// encoder is told the same `-r`, so with `passthrough` a variable-frame-rate
+/// source (typical phone footage) would emit fewer/more frames than
+/// `duration * fps`, making the overlay clock drift and `-shortest` truncate
+/// the output against the audio. `-nostdin` is safe here because this
+/// process's stdin is unused -- do not use it on the encoder, whose stdin
+/// carries real frame data.
+fn spawn_decoder(video_path: &Path, fps: f64) -> Result<DecodeProcess, CoreError> {
+    let fps_arg = format!("{fps}");
     let mut child = Command::new("ffmpeg")
         .args(["-nostdin", "-v", "error", "-i"])
         .arg(video_path)
-        .args([
-            "-an",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-fps_mode",
-            "passthrough",
-            "pipe:1",
-        ])
+        .args(["-an", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .args(["-fps_mode", "cfr", "-r", &fps_arg, "pipe:1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -325,15 +387,15 @@ fn spawn_decoder(video_path: &Path) -> Result<DecodeProcess, CoreError> {
         .map_err(|e| CoreError::Ffmpeg(format!("Failed to start decoder: {e}")))?;
 
     let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    spawn_stderr_drain(stderr, "ffmpeg-decode");
+    let stderr = spawn_stderr_capture(child.stderr.take().expect("stderr was piped"));
 
-    Ok(DecodeProcess { child, stdout })
+    Ok(DecodeProcess { child, stdout, stderr })
 }
 
 struct EncodeProcess {
     child: Child,
     stdin: Option<ChildStdin>,
+    stderr: JoinHandle<String>,
     info: EncoderInfo,
 }
 
@@ -365,7 +427,7 @@ fn spawn_encoder(
     let (encoder_name, pix_fmt, extra_args, info) = resolve_encoder(codec, preset, hw_accel);
 
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-y", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+    cmd.args(["-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24"])
         .args(["-s", &size_arg, "-r", &fps_arg, "-i", "pipe:0"])
         .arg("-i")
         .arg(original_input)
@@ -377,20 +439,18 @@ fn spawn_encoder(
         .args(["-c:a", "aac", "-b:a", "192k", "-shortest"])
         .arg(output_path)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| CoreError::Ffmpeg(format!("Failed to start encoder: {e}")))?;
 
     let stdin = child.stdin.take().expect("stdin was piped");
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    spawn_stderr_drain(stdout, "ffmpeg-encode-stdout");
-    spawn_stderr_drain(stderr, "ffmpeg-encode");
+    let stderr = spawn_stderr_capture(child.stderr.take().expect("stderr was piped"));
 
     Ok(EncodeProcess {
         child,
         stdin: Some(stdin),
+        stderr,
         info,
     })
 }
@@ -417,6 +477,7 @@ pub fn process_clip(
     if !job.video_path.exists() {
         return Err(CoreError::VideoNotFound(job.video_path.clone()));
     }
+    ensure_output_differs_from_input(&job.video_path, &job.output_path)?;
 
     let info = probe_video(&job.video_path)?;
     if info.width == 0 || info.height == 0 {
@@ -426,7 +487,7 @@ pub fn process_clip(
         )));
     }
 
-    let mut decoder = spawn_decoder(&job.video_path)?;
+    let mut decoder = spawn_decoder(&job.video_path, info.fps)?;
     let mut encoder = spawn_encoder(
         &job.output_path,
         &job.video_path,
@@ -457,7 +518,11 @@ pub fn process_clip(
         match decoder.stdout.read_exact(&mut buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(CoreError::Ffmpeg(format!("Error reading frames: {e}"))),
+            Err(e) => {
+                let _ = decoder.child.kill();
+                let _ = encoder.child.kill();
+                return Err(CoreError::Ffmpeg(format!("Error reading frames: {e}")));
+            }
         }
 
         let mut img = RgbImage::from_raw(info.width, info.height, std::mem::take(&mut buf))
@@ -473,9 +538,23 @@ pub fn process_clip(
         }
 
         if let Some(stdin) = encoder.stdin.as_mut() {
-            stdin
-                .write_all(img.as_raw())
-                .map_err(|e| CoreError::Ffmpeg(format!("Error writing frames: {e}")))?;
+            if let Err(e) = stdin.write_all(img.as_raw()) {
+                // Almost always a broken pipe because the encoder died (bad
+                // codec, unwritable output, ...): its stderr holds the real
+                // reason, so surface that instead of just "broken pipe".
+                let _ = decoder.child.kill();
+                let _ = decoder.child.wait();
+                encoder.stdin.take();
+                let status = encoder.child.wait();
+                let stderr_text = finish_stderr(encoder.stderr, "ffmpeg-encode", false);
+                return Err(match status {
+                    Ok(status) if !status.success() => ffmpeg_failure("Encoder", status, &stderr_text),
+                    _ if !stderr_text.is_empty() => {
+                        CoreError::Ffmpeg(format!("Error writing frames: {e}\n{stderr_text}"))
+                    }
+                    _ => CoreError::Ffmpeg(format!("Error writing frames: {e}")),
+                });
+            }
         }
 
         buf = img.into_raw();
@@ -488,7 +567,9 @@ pub fn process_clip(
     // The decode process should already be at EOF in the normal case; kill
     // defensively on early cancellation.
     let _ = decoder.child.kill();
-    let _ = decoder.child.wait();
+    let decoder_status = decoder.child.wait();
+    let decoder_ok = cancelled || decoder_status.as_ref().map(|s| s.success()).unwrap_or(false);
+    let decoder_stderr = finish_stderr(decoder.stderr, "ffmpeg-decode", decoder_ok);
 
     // Dropping the encoder's stdin lets ffmpeg see EOF and finalize the mp4
     // (moov atom etc.) -- keeping the handle alive here is a common hang cause.
@@ -497,8 +578,14 @@ pub fn process_clip(
         .child
         .wait()
         .map_err(|e| CoreError::Ffmpeg(format!("Encoder process failed: {e}")))?;
+    let encoder_stderr = finish_stderr(encoder.stderr, "ffmpeg-encode", status.success());
     if !status.success() {
-        return Err(CoreError::Ffmpeg(format!("Encoder exited with error: {status}")));
+        return Err(ffmpeg_failure("Encoder", status, &encoder_stderr));
+    }
+    if !decoder_ok {
+        if let Ok(decoder_status) = decoder_status {
+            return Err(ffmpeg_failure("Decoder", decoder_status, &decoder_stderr));
+        }
     }
 
     progress(frame_idx, total_estimate.max(frame_idx));
@@ -522,6 +609,7 @@ pub fn process_clip_subtitles(
     if !job.video_path.exists() {
         return Err(CoreError::VideoNotFound(job.video_path.clone()));
     }
+    ensure_output_differs_from_input(&job.video_path, &job.output_path)?;
 
     let info = probe_video(&job.video_path)?;
     let video_duration_sec = info
@@ -558,17 +646,12 @@ pub fn process_clip_subtitles(
         .args(["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text"])
         .arg(&job.output_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| CoreError::Ffmpeg(format!("Failed to start remux: {e}")))?;
 
-    if let Some(stdout) = child.stdout.take() {
-        spawn_stderr_drain(stdout, "ffmpeg-subtitle-stdout");
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_stderr_drain(stderr, "ffmpeg-subtitle");
-    }
+    let stderr = spawn_stderr_capture(child.stderr.take().expect("stderr was piped"));
 
     let mut cancelled = false;
     loop {
@@ -577,8 +660,9 @@ pub fn process_clip_subtitles(
             .map_err(|e| CoreError::Ffmpeg(format!("Error waiting for ffmpeg: {e}")))?
         {
             Some(status) => {
+                let stderr_text = finish_stderr(stderr, "ffmpeg-subtitle", status.success());
                 if !status.success() {
-                    return Err(CoreError::Ffmpeg(format!("Remux exited with error: {status}")));
+                    return Err(ffmpeg_failure("Remux", status, &stderr_text));
                 }
                 break;
             }
@@ -668,11 +752,172 @@ mod tests {
 
     #[test]
     fn codec_parse_recognizes_h265_aliases() {
-        assert_eq!(Codec::parse("hevc"), Codec::H265);
-        assert_eq!(Codec::parse("h265"), Codec::H265);
-        assert_eq!(Codec::parse("x265"), Codec::H265);
-        assert_eq!(Codec::parse("HEVC"), Codec::H265);
-        assert_eq!(Codec::parse(""), Codec::Auto);
+        assert_eq!(Codec::parse("hevc"), Some(Codec::H265));
+        assert_eq!(Codec::parse("h265"), Some(Codec::H265));
+        assert_eq!(Codec::parse("x265"), Some(Codec::H265));
+        assert_eq!(Codec::parse("HEVC"), Some(Codec::H265));
+        assert_eq!(Codec::parse(""), Some(Codec::Auto));
+        assert_eq!(Codec::parse("auto"), Some(Codec::Auto));
+        assert_eq!(Codec::parse("h.264"), None);
+    }
+
+    #[test]
+    fn rejects_output_equal_to_input_even_when_spelled_differently() {
+        let dir = make_test_dir("same_path");
+        let clip = synth_clip(&dir, "input.mp4", 1, 5);
+        let relative_spelling = dir.join("sub").join("..").join("INPUT.MP4");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+        assert!(ensure_output_differs_from_input(&clip, &clip).is_err());
+        if cfg!(windows) {
+            assert!(ensure_output_differs_from_input(&clip, &relative_spelling).is_err());
+        }
+        assert!(ensure_output_differs_from_input(&clip, &dir.join("other.mp4")).is_ok());
+
+        let job = ClipJob {
+            video_path: clip.clone(),
+            output_path: clip.clone(),
+            video_sync_sec: 0.0,
+            csv_sync_sec: 0.0,
+            video_start_utc: None,
+        };
+        let options = ProcessingOptions {
+            fields: vec![Field::Depth],
+            codec: Codec::Auto,
+            preset: Preset::VeryFast,
+            hw_accel: false,
+            show_graph: false,
+            mode: OutputMode::Overlay,
+            interpolate: false,
+        };
+        let err = process_clip(&job, &[], &[], &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("must differ"), "unexpected error: {err}");
+        // The input must be untouched.
+        assert!(probe_video(&clip).is_ok());
+    }
+
+    #[test]
+    fn encoder_failure_reports_ffmpeg_stderr() {
+        let dir = make_test_dir("encoder_error");
+        let clip = synth_clip(&dir, "input.mp4", 1, 5);
+        // A directory as the output path makes the encoder fail at open time.
+        let output_dir = dir.join("output_is_a_dir.mp4");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let job = ClipJob {
+            video_path: clip,
+            output_path: output_dir,
+            video_sync_sec: 0.0,
+            csv_sync_sec: 0.0,
+            video_start_utc: None,
+        };
+        let options = ProcessingOptions {
+            fields: vec![Field::Depth],
+            codec: Codec::Auto,
+            preset: Preset::VeryFast,
+            hw_accel: false,
+            show_graph: false,
+            mode: OutputMode::Overlay,
+            interpolate: false,
+        };
+        let err = process_clip(&job, &[], &[], &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains('\n') && text.lines().count() >= 2,
+            "expected ffmpeg's stderr to be appended to the error, got: {text}"
+        );
+    }
+
+    /// A 90-degree rotation tag makes ffmpeg's decoder emit portrait frames;
+    /// the pipeline must size buffers/encoder for those, not for the coded
+    /// landscape dimensions ffprobe reports.
+    #[test]
+    fn processes_rotated_clip_with_swapped_dimensions() {
+        let dir = make_test_dir("rotated");
+        let landscape = synth_clip(&dir, "landscape.mp4", 1, 5);
+        let rotated = dir.join("rotated.mp4");
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-display_rotation", "90", "-i"])
+            .arg(&landscape)
+            .args(["-c", "copy"])
+            .arg(&rotated)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let output = dir.join("output.mp4");
+
+        let job = ClipJob {
+            video_path: rotated,
+            output_path: output.clone(),
+            video_sync_sec: 0.0,
+            csv_sync_sec: 0.0,
+            video_start_utc: None,
+        };
+        let samples = vec![sample(0.0, 1.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let options = ProcessingOptions {
+            fields: vec![Field::Depth],
+            codec: Codec::Auto,
+            preset: Preset::VeryFast,
+            hw_accel: false,
+            show_graph: false,
+            mode: OutputMode::Overlay,
+            interpolate: false,
+        };
+        let completed =
+            process_clip(&job, &samples, &times, &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
+                .unwrap();
+        assert!(completed);
+
+        let info = probe_video(&output).unwrap();
+        assert_eq!((info.width, info.height), (120, 160));
+        assert_eq!(info.rotation_deg, 0, "output pixels are already upright; no rotation tag expected");
+    }
+
+    /// Variable-frame-rate input: the decoder must emit exactly
+    /// `duration * fps` frames so the overlay clock and the muxed audio stay
+    /// aligned instead of the video being squeezed and truncated.
+    #[test]
+    fn vfr_clip_keeps_full_duration() {
+        let dir = make_test_dir("vfr");
+        let vfr = dir.join("vfr.mp4");
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=30:duration=2"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2"])
+            .args(["-vf", "select='not(mod(n\\,3))+not(mod(n\\,5))'", "-fps_mode", "vfr"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+            .arg(&vfr)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let output = dir.join("output.mp4");
+
+        let job = ClipJob {
+            video_path: vfr,
+            output_path: output.clone(),
+            video_sync_sec: 0.0,
+            csv_sync_sec: 0.0,
+            video_start_utc: None,
+        };
+        let samples = vec![sample(0.0, 1.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let options = ProcessingOptions {
+            fields: vec![Field::Depth],
+            codec: Codec::Auto,
+            preset: Preset::VeryFast,
+            hw_accel: false,
+            show_graph: false,
+            mode: OutputMode::Overlay,
+            interpolate: false,
+        };
+        process_clip(&job, &samples, &times, &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
+            .unwrap();
+
+        let info = probe_video(&output).unwrap();
+        let duration = info.duration_sec.expect("output duration");
+        assert!((duration - 1.9).abs() < 0.25, "expected ~1.9s of video, got {duration}s");
     }
 
     #[test]

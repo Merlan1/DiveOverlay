@@ -21,10 +21,16 @@ pub fn parse_duration_to_seconds(value: &str) -> Result<f64, CoreError> {
         return Err(CoreError::InvalidDuration("Empty time value".to_string()));
     }
 
+    // Rust's f64 parser accepts "nan"/"inf"; neither is a usable duration
+    // (and NaN would break sorting of the sample list), so reject them here.
+    let finite = |v: f64| if v.is_finite() { Some(v) } else { None };
+
     if !value.contains(':') {
         return value
             .parse::<f64>()
-            .map_err(|_| CoreError::InvalidDuration(value.to_string()));
+            .ok()
+            .and_then(finite)
+            .ok_or_else(|| CoreError::InvalidDuration(value.to_string()));
     }
 
     let parts: Vec<&str> = value.split(':').collect();
@@ -32,19 +38,21 @@ pub fn parse_duration_to_seconds(value: &str) -> Result<f64, CoreError> {
     match parts.len() {
         2 => {
             let minutes: i64 = parts[0].parse().map_err(|_| err())?;
-            let seconds: f64 = parts[1].parse().map_err(|_| err())?;
+            let seconds: f64 = parts[1].parse().ok().and_then(finite).ok_or_else(err)?;
             Ok(minutes as f64 * 60.0 + seconds)
         }
         3 => {
             let hours: i64 = parts[0].parse().map_err(|_| err())?;
             let minutes: i64 = parts[1].parse().map_err(|_| err())?;
-            let seconds: f64 = parts[2].parse().map_err(|_| err())?;
+            let seconds: f64 = parts[2].parse().ok().and_then(finite).ok_or_else(err)?;
             Ok(hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds)
         }
         _ => Err(err()),
     }
 }
 
+/// Formats to whole seconds (`mm:ss` / `hh:mm:ss`), rounding -- what the
+/// overlay's "Dive time" line shows.
 pub fn format_duration(seconds: f64) -> String {
     let total = seconds.round().max(0.0) as i64;
     let hours = total / 3600;
@@ -54,6 +62,30 @@ pub fn format_duration(seconds: f64) -> String {
         format!("{hours:02}:{minutes:02}:{sec:02}")
     } else {
         format!("{minutes:02}:{sec:02}")
+    }
+}
+
+/// Like `format_duration` but keeps fractional seconds (to the millisecond,
+/// trailing zeros trimmed, e.g. `00:10.5`), so a value round-trips through
+/// `parse_duration_to_seconds` without being rounded to a whole second.
+/// Used where the string is *stored* (the GUI's per-clip CSV sync field)
+/// rather than displayed.
+pub fn format_duration_precise(seconds: f64) -> String {
+    let millis_total = (seconds.max(0.0) * 1000.0).round() as i64;
+    let millis = millis_total % 1000;
+    if millis == 0 {
+        return format_duration((millis_total / 1000) as f64);
+    }
+    let total = millis_total / 1000;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let sec = total % 60;
+    let frac = format!("{millis:03}");
+    let frac = frac.trim_end_matches('0');
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{sec:02}.{frac}")
+    } else {
+        format!("{minutes:02}:{sec:02}.{frac}")
     }
 }
 
@@ -100,11 +132,43 @@ pub fn read_csv_headers(csv_path: &Path) -> Result<Vec<String>, CoreError> {
     Ok(headers)
 }
 
-pub fn read_csv_datetime_columns(csv_path: &Path) -> Result<(Option<String>, Option<String>), CoreError> {
+/// `find_column_index` with one header index masked out, so a column already
+/// claimed for another purpose can't be matched again by the substring pass.
+fn find_column_index_excluding(headers: &[String], candidates: &[&str], exclude: Option<usize>) -> Option<usize> {
+    match exclude {
+        None => find_column_index(headers, candidates),
+        Some(skip) => {
+            let masked: Vec<String> = headers
+                .iter()
+                .enumerate()
+                .map(|(i, h)| if i == skip { String::new() } else { h.clone() })
+                .collect();
+            find_column_index(&masked, candidates)
+        }
+    }
+}
+
+const ELAPSED_TIME_CANDIDATES: [&str; 3] = ["sample time (min)", "sample time", "time"];
+
+/// Resolves the CSV's date and wall-clock time columns (for auto-sync),
+/// honoring `date=`/`clock=` overrides from `--column-map` first. Without
+/// an override, the wall-clock heuristic deliberately skips whichever
+/// column holds the *elapsed* dive time: with no exact `time` header, the
+/// substring pass would otherwise happily pick `sample time (min)` as the
+/// clock column and every datetime parse would fail.
+pub fn read_csv_datetime_columns(
+    csv_path: &Path,
+    column_map: &HashMap<String, String>,
+) -> Result<(Option<String>, Option<String>), CoreError> {
     let headers = read_csv_headers(csv_path)?;
-    let date_idx = find_column_index(&headers, &["date", "datum", "sample date"]);
-    let time_idx = find_column_index(&headers, &["time", "zeit", "sample time", "clock time"]);
-    Ok((date_idx.map(|i| headers[i].clone()), time_idx.map(|i| headers[i].clone())))
+    let elapsed_idx = resolve_from_map(column_map, &headers, "time")?
+        .or_else(|| find_column_index(&headers, &ELAPSED_TIME_CANDIDATES));
+    let date_idx = resolve_from_map(column_map, &headers, "date")?
+        .or_else(|| find_column_index(&headers, &["date", "datum", "sample date"]));
+    let clock_idx = resolve_from_map(column_map, &headers, "clock")?.or_else(|| {
+        find_column_index_excluding(&headers, &["time", "zeit", "clock time", "clock"], elapsed_idx)
+    });
+    Ok((date_idx.map(|i| headers[i].clone()), clock_idx.map(|i| headers[i].clone())))
 }
 
 /// Reads the first data row's values for the given column names (by
@@ -223,7 +287,7 @@ pub fn load_samples(csv_path: &Path, column_map: &HashMap<String, String>) -> Re
     }
 
     let time_idx = resolve_from_map(column_map, &headers, "time")?
-        .or_else(|| find_column_index(&headers, &["sample time (min)", "sample time", "time"]));
+        .or_else(|| find_column_index(&headers, &ELAPSED_TIME_CANDIDATES));
     let depth_idx = resolve_from_map(column_map, &headers, "depth")?
         .or_else(|| find_column_index(&headers, &["sample depth (m)", "sample depth", "depth"]));
     let temp_idx = resolve_from_map(column_map, &headers, "temp")?.or_else(|| {
@@ -259,7 +323,7 @@ pub fn load_samples(csv_path: &Path, column_map: &HashMap<String, String>) -> Re
         });
     }
 
-    samples.sort_by(|a, b| a.elapsed_sec.partial_cmp(&b.elapsed_sec).unwrap());
+    samples.sort_by(|a, b| a.elapsed_sec.total_cmp(&b.elapsed_sec));
     if samples.is_empty() {
         return Err(CoreError::NoSamples);
     }
@@ -292,11 +356,74 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_finite_durations() {
+        assert!(parse_duration_to_seconds("nan").is_err());
+        assert!(parse_duration_to_seconds("inf").is_err());
+        assert!(parse_duration_to_seconds("1:NaN").is_err());
+    }
+
+    #[test]
+    fn load_samples_does_not_panic_on_nan_time_value() {
+        let dir = std::env::temp_dir().join("dive_overlay_csv_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nan.csv");
+        std::fs::write(&path, "sample time (min),sample depth (m)\n0:10,1.0\nnan,2.0\n").unwrap();
+        assert!(load_samples(&path, &HashMap::new()).is_err());
+    }
+
+    #[test]
     fn format_duration_round_trip() {
         assert_eq!(format_duration(10.0), "00:10");
         assert_eq!(format_duration(90.0), "01:30");
         assert_eq!(format_duration(3600.0), "01:00:00");
         assert_eq!(format_duration(-5.0), "00:00");
+    }
+
+    #[test]
+    fn format_duration_precise_keeps_fractional_seconds_and_round_trips() {
+        assert_eq!(format_duration_precise(10.0), "00:10");
+        assert_eq!(format_duration_precise(10.5), "00:10.5");
+        assert_eq!(format_duration_precise(9.5), "00:09.5");
+        assert_eq!(format_duration_precise(3661.25), "01:01:01.25");
+        assert_eq!(format_duration_precise(9.9999), "00:10");
+        for v in [0.0, 0.5, 9.5, 10.5, 59.5, 61.25, 3600.75] {
+            let s = format_duration_precise(v);
+            assert!((parse_duration_to_seconds(&s).unwrap() - v).abs() < 1e-9, "{v} -> {s}");
+        }
+    }
+
+    #[test]
+    fn datetime_columns_skip_elapsed_time_column_and_honor_column_map() {
+        let dir = std::env::temp_dir().join("dive_overlay_csv_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No exact "time" header: the clock heuristic must not grab the
+        // elapsed "sample time (min)" column.
+        let path = dir.join("no_clock.csv");
+        std::fs::write(&path, "date,sample time (min),sample depth (m)\n2025-07-05,0:10,1.0\n").unwrap();
+        let (date, clock) = read_csv_datetime_columns(&path, &HashMap::new()).unwrap();
+        assert_eq!(date.as_deref(), Some("date"));
+        assert_eq!(clock, None);
+
+        // ...but a clock column with an unusual name still matches by substring.
+        let path = dir.join("time_of_day.csv");
+        std::fs::write(&path, "date,sample time (min),Time of day,sample depth (m)\n2025-07-05,0:10,15:32:55,1.0\n")
+            .unwrap();
+        let (_, clock) = read_csv_datetime_columns(&path, &HashMap::new()).unwrap();
+        assert_eq!(clock.as_deref(), Some("Time of day"));
+
+        // Explicit overrides win over every heuristic.
+        let path = dir.join("mapped.csv");
+        std::fs::write(&path, "D,C,sample time (min),sample depth (m)\n2025-07-05,15:32:55,0:10,1.0\n").unwrap();
+        let mut map = HashMap::new();
+        map.insert("date".to_string(), "D".to_string());
+        map.insert("clock".to_string(), "c".to_string());
+        let (date, clock) = read_csv_datetime_columns(&path, &map).unwrap();
+        assert_eq!(date.as_deref(), Some("D"));
+        assert_eq!(clock.as_deref(), Some("C"));
+
+        map.insert("clock".to_string(), "missing".to_string());
+        assert!(read_csv_datetime_columns(&path, &map).is_err());
     }
 
     #[test]

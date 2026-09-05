@@ -91,13 +91,13 @@ cargo run --release --bin dive_overlay_cli -- \
 | --- | --- |
 | `--output out.mp4` | Custom output filename |
 | `--fields time,depth,temp,pressure,hr` | Which values are displayed |
-| `--column-map time=TIME,depth=Depth` | Manual CSV column mapping |
+| `--column-map time=TIME,depth=Depth` | Manual CSV column mapping (keys: `time`, `depth`, `temp`, `pressure`, `hr`, plus `date`/`clock` for the wall-clock columns auto-sync reads) |
 | `--clip "video\|video_sync\|csv_sync[\|out]"` | Repeatable, for multi-clip jobs |
 | `--codec auto\|avc1\|H264\|hevc\|H265\|mp4v\|XVID\|MJPG` | Video codec (overlay mode only); `auto`/`H264`/`avc1` → `libx264`, `hevc`/`H265` → `libx265` |
 | `--preset ultrafast…placebo` | H264/H265 encoder preset (speed vs. compression), default `veryfast` |
 | `--hw-accel` | Hardware encoding (Intel Quick Sync or NVIDIA NVENC) for H264/H265, falling back to software automatically; the actual encoder used is printed/shown |
 | `--show-graph` | Small depth-profile graph (overlay mode only) |
-| `--interpolate` | Linearly interpolates field values between samples instead of carrying the last known reading forward |
+| `--interpolate` | Smoothly interpolates field values between samples (cubic spline) instead of carrying the last known reading forward |
 | `--mode overlay\|subtitles` | See [Output modes](#output-modes) above |
 | `--auto-sync`, `--base-clip`, `--base-video-sync-sec`, `--base-csv-datetime` | Automatic sync, see above |
 
