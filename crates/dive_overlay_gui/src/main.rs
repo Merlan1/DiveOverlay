@@ -9,12 +9,13 @@ use dive_overlay_core::csv_data::{
     format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds, parse_fields,
 };
 use dive_overlay_core::ffprobe::probe_video;
-use dive_overlay_core::model::Field;
+use dive_overlay_core::merge::{finish_merge, plan_merge, MergePlan};
 use dive_overlay_core::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay, OverlayCache};
 use dive_overlay_core::pipeline::{
     extract_frame_at, process_clip, Codec, EncoderInfo, OutputMode, Preset, ProcessingOptions,
 };
-use dive_overlay_core::ClipJob;
+use dive_overlay_core::sync::{compute_auto_sync, AutoSyncParams};
+use dive_overlay_core::{ClipJob, DiveSample, RgbImage};
 
 mod update_check;
 use update_check::UpdateStatus;
@@ -43,6 +44,30 @@ struct ClipEntry {
     video_sync_sec: f64,
     csv_sync_mmss: String,
     output_path: PathBuf,
+}
+
+/// Auto-sync settings: only the base clip is synced by hand, and every
+/// other clip's CSV sync point is derived from how much later it started
+/// recording (see `dive_overlay_core::sync::compute_auto_sync`).
+#[derive(Clone)]
+struct AutoSyncConfig {
+    base_clip: PathBuf,
+    base_video_sync_sec: f64,
+    base_csv_datetime: String,
+}
+
+/// Everything the background worker needs for one run, bundled up so a new
+/// setting doesn't mean threading another positional argument through the
+/// spawn site.
+struct WorkerConfig {
+    csv_path: PathBuf,
+    column_map: HashMap<String, String>,
+    entries: Vec<ClipEntry>,
+    options: ProcessingOptions,
+    auto_sync: Option<AutoSyncConfig>,
+    /// When set, the clips are joined into this one file and their
+    /// individual outputs are demoted to scratch parts.
+    merge_output: Option<PathBuf>,
 }
 
 enum WorkerEvent {
@@ -114,9 +139,38 @@ impl ClipDialogState {
 
 struct PreviewState {
     clip_index: usize,
+    /// The decoded frame *without* the overlay drawn on it. Typing in the
+    /// CSV sync field redraws the info box straight from this, so only
+    /// moving the video position pays for another ffmpeg seek and decode.
+    frame: RgbImage,
     texture: egui::TextureHandle,
     size: egui::Vec2,
     lines: Vec<String>,
+    /// Clip length, so the scrub buttons can't walk off the end of the
+    /// video into an opaque "could not read a frame" error.
+    duration_sec: f64,
+    /// Cached alongside the frame for the same reason: redrawing on every
+    /// keystroke must not re-parse the whole CSV.
+    samples: Vec<DiveSample>,
+    times: Vec<f64>,
+    /// Edit buffer for the CSV sync field. Half-typed values like `1:` are
+    /// held here and only written back to the clip once they parse.
+    csv_sync_edit: String,
+    csv_sync_error: Option<String>,
+}
+
+/// Applies one scrub step to a video sync point, keeping it inside the clip.
+/// `duration_sec` of 0 means ffprobe didn't report one, in which case only
+/// the lower bound is enforced.
+fn scrubbed_video_sync(current: f64, delta: f64, duration_sec: f64) -> f64 {
+    let moved = current + delta;
+    if duration_sec > 0.0 {
+        // A hair short of the end: seeking to exactly the duration lands
+        // past the last frame and decodes nothing.
+        moved.clamp(0.0, (duration_sec - 0.05).max(0.0))
+    } else {
+        moved.max(0.0)
+    }
 }
 
 struct App {
@@ -129,6 +183,12 @@ struct App {
     show_graph: bool,
     interpolate: bool,
     mode: OutputMode,
+    merge_enabled: bool,
+    merge_output: String,
+    auto_sync: bool,
+    base_clip_index: usize,
+    base_video_sync: String,
+    base_csv_datetime: String,
     entries: Vec<ClipEntry>,
     selected: Option<usize>,
     status: String,
@@ -158,6 +218,12 @@ impl Default for App {
             show_graph: false,
             interpolate: false,
             mode: OutputMode::Overlay,
+            merge_enabled: false,
+            merge_output: String::new(),
+            auto_sync: false,
+            base_clip_index: 0,
+            base_video_sync: "0.0".to_string(),
+            base_csv_datetime: String::new(),
             entries: Vec::new(),
             selected: None,
             status: "Ready".to_string(),
@@ -186,6 +252,7 @@ impl eframe::App for App {
         egui::Panel::top("general").show(ui, |ui| {
             self.ui_update_banner(ui);
             self.ui_general(ui);
+            self.ui_multi_clip(ui);
         });
         egui::Panel::bottom("execution").show(ui, |ui| {
             self.ui_execution(ui, &ctx);
@@ -342,6 +409,67 @@ impl App {
         }
         if !self.encoder_info.is_empty() {
             ui.label(format!("Encoder: {}", self.encoder_info));
+        }
+    }
+
+    /// The settings that only mean anything across several clips of one
+    /// dive: joining them into a single file, and deriving their sync
+    /// points from one another instead of entering each by hand.
+    fn ui_multi_clip(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.merge_enabled, "Combine all clips into one dive video");
+            ui.add_enabled_ui(self.merge_enabled, |ui| {
+                ui.label("Output:");
+                ui.text_edit_singleline(&mut self.merge_output);
+                if ui.button("Save as").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("MP4", &["mp4"]).save_file() {
+                        self.merge_output = path.display().to_string();
+                    }
+                }
+            });
+        });
+        if self.merge_enabled {
+            ui.weak("Sorted by dive time, joined back-to-back with no filler for the gaps. Only the combined file is kept.");
+        }
+
+        ui.checkbox(&mut self.auto_sync, "Auto-sync clips from their recording timestamps");
+        if self.auto_sync {
+            let names: Vec<String> = self
+                .entries
+                .iter()
+                .map(|e| {
+                    e.video_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            let mut base_clip_index = self.base_clip_index;
+
+            ui.horizontal(|ui| {
+                ui.label("Base clip:");
+                let selected_text = names.get(base_clip_index).cloned().unwrap_or_else(|| "<none>".to_string());
+                egui::ComboBox::from_id_salt("base_clip")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            ui.selectable_value(&mut base_clip_index, i, name);
+                        }
+                    });
+                ui.label("Video sync (s):");
+                ui.add(egui::TextEdit::singleline(&mut self.base_video_sync).desired_width(60.0));
+                ui.label("CSV date/time:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.base_csv_datetime)
+                        .desired_width(190.0)
+                        .hint_text("2025-07-05 15:32:55"),
+                );
+            });
+
+            self.base_clip_index = base_clip_index;
+            ui.weak("Only the base clip is synced by hand; the CSV sync values in the table are recomputed from how much later each clip started recording. Needs date and time columns in the CSV.");
         }
     }
 
@@ -525,14 +653,18 @@ impl App {
         }
     }
 
+    /// Two steps, in the order a diver actually works: scrub the video until
+    /// the dive computer is readable in frame (which moves the *video* sync
+    /// point), then type the dive time it shows (the CSV sync point).
     fn ui_preview_window(&mut self, ctx: &egui::Context) {
         if self.preview.is_none() {
             return;
         }
         let clip_index = self.preview.as_ref().unwrap().clip_index;
-        let mut open = true;
-        let mut adjust: Option<f64> = None;
+        let mut scrub: Option<f64> = None;
         let mut reload = false;
+        let mut csv_sync_edited = false;
+        let mut open = true;
 
         egui::Window::new("Sync preview")
             .open(&mut open)
@@ -540,17 +672,16 @@ impl App {
             .show(ctx, |ui| {
                 if let Some(entry) = self.entries.get(clip_index) {
                     ui.label(format!(
-                        "Video: {} | Video sync: {:.2}s | CSV sync: {}",
+                        "Video: {}",
                         entry
                             .video_path
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default(),
-                        entry.video_sync_sec,
-                        entry.csv_sync_mmss,
                     ));
                 }
 
+                ui.weak("1. Scrub to the frame where the dive computer is readable.");
                 ui.horizontal(|ui| {
                     for (label, delta) in [
                         ("-1 min", -60.0),
@@ -563,13 +694,41 @@ impl App {
                         ("+1 min", 60.0),
                     ] {
                         if ui.button(label).clicked() {
-                            adjust = Some(delta);
+                            scrub = Some(delta);
                         }
                     }
                     if ui.button("Reload").clicked() {
                         reload = true;
                     }
                 });
+                ui.horizontal(|ui| {
+                    let position = self.entries.get(clip_index).map(|e| e.video_sync_sec).unwrap_or(0.0);
+                    let duration = self.preview.as_ref().map(|p| p.duration_sec).unwrap_or(0.0);
+                    if duration > 0.0 {
+                        ui.label(format!("Video sync: {position:.2} s of {duration:.2} s"));
+                    } else {
+                        ui.label(format!("Video sync: {position:.2} s"));
+                    }
+                });
+
+                ui.separator();
+
+                ui.weak("2. Enter the dive time the computer reads in this frame.");
+                ui.horizontal(|ui| {
+                    ui.label("CSV sync (mm:ss or hh:mm:ss):");
+                    if let Some(preview) = self.preview.as_mut() {
+                        let response =
+                            ui.add(egui::TextEdit::singleline(&mut preview.csv_sync_edit).desired_width(90.0));
+                        if response.changed() {
+                            csv_sync_edited = true;
+                        }
+                    }
+                });
+                if let Some(error) = self.preview.as_ref().and_then(|p| p.csv_sync_error.as_ref()) {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+
+                ui.separator();
 
                 if let Some(preview) = &self.preview {
                     let available = ui.available_size();
@@ -586,24 +745,123 @@ impl App {
             return;
         }
 
-        if let Some(delta) = adjust {
+        if let Some(delta) = scrub {
+            let duration = self.preview.as_ref().map(|p| p.duration_sec).unwrap_or(0.0);
             if let Some(entry) = self.entries.get_mut(clip_index) {
-                let current = parse_duration_to_seconds(&entry.csv_sync_mmss).unwrap_or(0.0);
-                // Must keep fractional seconds: the whole-second formatter
-                // would turn "-0.5 s" into a no-op and "+0.5 s" into +1 s.
-                entry.csv_sync_mmss = format_duration_precise((current + delta).max(0.0));
+                entry.video_sync_sec = scrubbed_video_sync(entry.video_sync_sec, delta, duration);
             }
-            self.render_preview(clip_index, ctx);
+            self.refresh_preview_frame(ctx);
         } else if reload {
             self.render_preview(clip_index, ctx);
+        } else if csv_sync_edited {
+            let text = self.preview.as_ref().map(|p| p.csv_sync_edit.clone()).unwrap_or_default();
+            match parse_duration_to_seconds(&text) {
+                Ok(_) => {
+                    if let Some(entry) = self.entries.get_mut(clip_index) {
+                        entry.csv_sync_mmss = text;
+                    }
+                    if let Some(preview) = self.preview.as_mut() {
+                        preview.csv_sync_error = None;
+                    }
+                    self.redraw_preview_overlay(ctx);
+                }
+                // Half-typed input is normal while someone is still typing,
+                // so this only marks the field -- the clip keeps its last
+                // value rather than being clobbered with garbage.
+                Err(e) => {
+                    if let Some(preview) = self.preview.as_mut() {
+                        preview.csv_sync_error = Some(e.to_string());
+                    }
+                }
+            }
         }
     }
 
+    /// Opens (or fully reloads) the preview: re-reads the CSV, re-probes the
+    /// clip and seeks to the current video sync point.
     fn render_preview(&mut self, idx: usize, ctx: &egui::Context) {
         match self.try_render_preview(idx, ctx) {
             Ok(preview) => self.preview = Some(preview),
             Err(e) => self.log_lines.push(format!("Preview failed: {e}")),
         }
+    }
+
+    /// Re-seeks after the scrub buttons moved the video sync point, keeping
+    /// the CSV samples already loaded for this preview.
+    fn refresh_preview_frame(&mut self, ctx: &egui::Context) {
+        let Some(preview) = self.preview.as_ref() else { return };
+        let idx = preview.clip_index;
+        let Some(entry) = self.entries.get(idx) else { return };
+        let (video_path, second) = (entry.video_path.clone(), entry.video_sync_sec);
+
+        let frame = match extract_frame_at(&video_path, second) {
+            Ok(frame) => frame,
+            Err(e) => {
+                self.log_lines.push(format!("Preview failed: {e}"));
+                return;
+            }
+        };
+
+        let preview = self.preview.as_ref().expect("checked above");
+        let drawn = self.draw_preview_frame(idx, &frame, &preview.samples, &preview.times, ctx);
+        match drawn {
+            Ok((texture, size, lines)) => {
+                let preview = self.preview.as_mut().expect("checked above");
+                preview.frame = frame;
+                preview.texture = texture;
+                preview.size = size;
+                preview.lines = lines;
+            }
+            Err(e) => self.log_lines.push(format!("Preview failed: {e}")),
+        }
+    }
+
+    /// Redraws the info box on the frame already on screen -- what a
+    /// keystroke in the CSV sync field triggers, with no ffmpeg call at all.
+    fn redraw_preview_overlay(&mut self, ctx: &egui::Context) {
+        let Some(preview) = self.preview.as_ref() else { return };
+        let idx = preview.clip_index;
+        let drawn = self.draw_preview_frame(idx, &preview.frame, &preview.samples, &preview.times, ctx);
+        match drawn {
+            Ok((texture, size, lines)) => {
+                let preview = self.preview.as_mut().expect("checked above");
+                preview.texture = texture;
+                preview.size = size;
+                preview.lines = lines;
+            }
+            Err(e) => self.log_lines.push(format!("Preview failed: {e}")),
+        }
+    }
+
+    /// Draws the clip's current CSV sync onto a copy of `frame` and uploads
+    /// it as a texture. `frame` itself stays clean so it can be redrawn
+    /// again with a different sync point.
+    fn draw_preview_frame(
+        &self,
+        idx: usize,
+        frame: &RgbImage,
+        samples: &[DiveSample],
+        times: &[f64],
+        ctx: &egui::Context,
+    ) -> anyhow::Result<(egui::TextureHandle, egui::Vec2, Vec<String>)> {
+        let entry = self
+            .entries
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("Invalid clip index"))?;
+        let fields = parse_fields(&self.fields)?;
+        let csv_sync_sec = parse_duration_to_seconds(&entry.csv_sync_mmss)?;
+
+        let mut frame = frame.clone();
+        let lines = build_overlay_lines(&fields, samples, times, csv_sync_sec, self.interpolate);
+        draw_overlay(&mut frame, &lines, &mut OverlayCache::new());
+        if self.show_graph {
+            draw_depth_graph(&mut frame, samples, times, csv_sync_sec, 600.0);
+        }
+
+        let (w, h) = frame.dimensions();
+        let color_image = egui::ColorImage::from_rgb([w as usize, h as usize], frame.as_raw());
+        let texture = ctx.load_texture(format!("preview-{idx}"), color_image, egui::TextureOptions::default());
+        Ok((texture, egui::vec2(w as f32, h as f32), lines))
     }
 
     fn try_render_preview(&self, idx: usize, ctx: &egui::Context) -> anyhow::Result<PreviewState> {
@@ -620,29 +878,25 @@ impl App {
             anyhow::bail!("Please select a valid CSV file first.");
         }
 
-        let fields = parse_fields(&self.fields)?;
         let column_map = parse_column_map(&self.column_map)?;
-        let csv_sync_sec = parse_duration_to_seconds(&entry.csv_sync_mmss)?;
         let samples = load_samples(&csv_path, &column_map)?;
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let duration_sec = probe_video(&entry.video_path)?.duration_sec.unwrap_or(0.0);
 
-        let mut frame = extract_frame_at(&entry.video_path, entry.video_sync_sec)?;
-        let lines = build_overlay_lines(&fields, &samples, &times, csv_sync_sec, self.interpolate);
-        draw_overlay(&mut frame, &lines, &mut OverlayCache::new());
-        if self.show_graph {
-            draw_depth_graph(&mut frame, &samples, &times, csv_sync_sec, 600.0);
-        }
-
-        let (w, h) = frame.dimensions();
-        let color_image = egui::ColorImage::from_rgb([w as usize, h as usize], frame.as_raw());
-        let size = egui::vec2(w as f32, h as f32);
-        let texture = ctx.load_texture(format!("preview-{idx}"), color_image, egui::TextureOptions::default());
+        let frame = extract_frame_at(&entry.video_path, entry.video_sync_sec)?;
+        let (texture, size, lines) = self.draw_preview_frame(idx, &frame, &samples, &times, ctx)?;
 
         Ok(PreviewState {
             clip_index: idx,
+            frame,
             texture,
             size,
             lines,
+            duration_sec,
+            samples,
+            times,
+            csv_sync_edit: entry.csv_sync_mmss.clone(),
+            csv_sync_error: None,
         })
     }
 
@@ -726,11 +980,59 @@ impl App {
             }
         };
         let preset = Preset::parse(&self.preset).unwrap_or_default();
-        let hw_accel = self.hw_accel;
-        let show_graph = self.show_graph;
-        let interpolate = self.interpolate;
-        let mode = self.mode;
-        let entries = self.entries.clone();
+
+        let merge_output = if self.merge_enabled {
+            let trimmed = self.merge_output.trim();
+            if trimmed.is_empty() {
+                self.log_lines
+                    .push("Error: please specify an output path for the combined video.".to_string());
+                return;
+            }
+            Some(PathBuf::from(trimmed).with_extension("mp4"))
+        } else {
+            None
+        };
+
+        let auto_sync = if self.auto_sync {
+            let Some(entry) = self.entries.get(self.base_clip_index) else {
+                self.log_lines.push("Error: please select a base clip for auto-sync.".to_string());
+                return;
+            };
+            let Ok(base_video_sync_sec) = self.base_video_sync.trim().parse::<f64>() else {
+                self.log_lines
+                    .push("Error: the base clip's video sync must be a number.".to_string());
+                return;
+            };
+            if self.base_csv_datetime.trim().is_empty() {
+                self.log_lines
+                    .push("Error: please enter the CSV date/time of the base clip's sync point.".to_string());
+                return;
+            }
+            Some(AutoSyncConfig {
+                base_clip: entry.video_path.clone(),
+                base_video_sync_sec,
+                base_csv_datetime: self.base_csv_datetime.trim().to_string(),
+            })
+        } else {
+            None
+        };
+
+        let config = WorkerConfig {
+            csv_path,
+            column_map,
+            entries: self.entries.clone(),
+            options: ProcessingOptions {
+                fields,
+                codec,
+                preset,
+                hw_accel: self.hw_accel,
+                show_graph: self.show_graph,
+                mode: self.mode,
+                interpolate: self.interpolate,
+            },
+            auto_sync,
+            merge_output,
+        };
 
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = self.cancel_flag.clone();
@@ -746,21 +1048,7 @@ impl App {
 
         let worker_ctx = ctx.clone();
         let handle = std::thread::spawn(move || {
-            let result = run_worker(
-                csv_path,
-                fields,
-                column_map,
-                entries,
-                codec,
-                preset,
-                hw_accel,
-                show_graph,
-                interpolate,
-                mode,
-                &cancel_flag,
-                &tx,
-                &worker_ctx,
-            );
+            let result = run_worker(config, &cancel_flag, &tx, &worker_ctx);
             let _ = tx.send(WorkerEvent::Done(result));
             worker_ctx.request_repaint();
         });
@@ -768,71 +1056,98 @@ impl App {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_worker(
-    csv_path: PathBuf,
-    fields: Vec<Field>,
-    column_map: HashMap<String, String>,
-    entries: Vec<ClipEntry>,
-    codec: Codec,
-    preset: Preset,
-    hw_accel: bool,
-    show_graph: bool,
-    interpolate: bool,
-    mode: OutputMode,
+    config: WorkerConfig,
     cancel_flag: &Arc<AtomicBool>,
     tx: &Sender<WorkerEvent>,
     ctx: &egui::Context,
 ) -> Result<bool, String> {
+    let WorkerConfig {
+        csv_path,
+        column_map,
+        entries,
+        options,
+        auto_sync,
+        merge_output,
+    } = config;
+
     let samples = load_samples(&csv_path, &column_map).map_err(|e| e.to_string())?;
     let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
-    let total = entries.len();
 
+    let mut jobs = entries
+        .iter()
+        .map(|entry| {
+            Ok(ClipJob {
+                video_path: entry.video_path.clone(),
+                output_path: entry.output_path.with_extension("mp4"),
+                video_sync_sec: entry.video_sync_sec,
+                csv_sync_sec: parse_duration_to_seconds(&entry.csv_sync_mmss).map_err(|e| e.to_string())?,
+                video_start_utc: None,
+            })
+        })
+        .collect::<Result<Vec<ClipJob>, String>>()?;
+
+    if let Some(auto) = &auto_sync {
+        let params = AutoSyncParams {
+            base_clip: &auto.base_clip,
+            base_video_sync_sec: auto.base_video_sync_sec,
+            base_csv_datetime: &auto.base_csv_datetime,
+        };
+        compute_auto_sync(&csv_path, &column_map, &mut jobs, &params).map_err(|e| e.to_string())?;
+        for job in &jobs {
+            let _ = tx.send(WorkerEvent::Log(format!(
+                "Auto-sync: {} -> CSV {}",
+                job.video_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                format_duration_precise(job.csv_sync_sec),
+            )));
+        }
+        ctx.request_repaint();
+    }
+
+    // Planning the merge both orders the jobs by dive time and redirects
+    // them to scratch part files, so the loop below already writes the
+    // parts in the order they will be joined.
+    let plan = match &merge_output {
+        Some(path) => Some(plan_merge(&mut jobs, path).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    // A failed or cancelled merged run keeps its finished parts rather than
+    // deleting them, so the message has to say where they ended up.
+    let parts_note = |plan: Option<&MergePlan>| match plan {
+        Some(plan) => format!("\nPartial results kept in: {}", plan.parts_dir.display()),
+        None => String::new(),
+    };
+
+    let total = jobs.len();
     let mut clip_frame_totals = Vec::with_capacity(total);
-    for entry in &entries {
-        let info = probe_video(&entry.video_path).map_err(|e| e.to_string())?;
+    for job in &jobs {
+        let info = probe_video(&job.video_path).map_err(|e| e.to_string())?;
         clip_frame_totals.push(info.estimated_frames.unwrap_or(0).max(1));
     }
     let total_frames_all: u64 = clip_frame_totals.iter().sum::<u64>().max(total as u64).max(1);
 
     let mut base_done_frames: u64 = 0;
 
-    for (idx, entry) in entries.iter().enumerate() {
+    for (idx, job) in jobs.iter().enumerate() {
         let _ = tx.send(WorkerEvent::Log(format!(
             "[{}/{}] {} -> {}",
             idx + 1,
             total,
-            entry
-                .video_path
+            job.video_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default(),
-            entry
-                .output_path
+            job.output_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default(),
         )));
         ctx.request_repaint();
 
-        let csv_sync_sec = parse_duration_to_seconds(&entry.csv_sync_mmss).map_err(|e| e.to_string())?;
-        let job = ClipJob {
-            video_path: entry.video_path.clone(),
-            output_path: entry.output_path.with_extension("mp4"),
-            video_sync_sec: entry.video_sync_sec,
-            csv_sync_sec,
-            video_start_utc: None,
-        };
         let clip_total = clip_frame_totals[idx];
-        let options = ProcessingOptions {
-            fields: fields.clone(),
-            codec,
-            preset,
-            hw_accel,
-            show_graph,
-            mode,
-            interpolate,
-        };
 
         let tx_progress = tx.clone();
         let ctx_progress = ctx.clone();
@@ -840,7 +1155,7 @@ fn run_worker(
         let mut last_instant = std::time::Instant::now();
         let mut last_done: u64 = 0;
         let completed = process_clip(
-            &job,
+            job,
             &samples,
             &times,
             &options,
@@ -871,10 +1186,13 @@ fn run_worker(
                 let _ = tx_encoder.send(WorkerEvent::Encoder(info.describe()));
             },
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e}{}", parts_note(plan.as_ref())))?;
 
         if !completed {
-            let _ = tx.send(WorkerEvent::Log("Cancelled: processing stopped.".to_string()));
+            let _ = tx.send(WorkerEvent::Log(format!(
+                "Cancelled: processing stopped.{}",
+                parts_note(plan.as_ref())
+            )));
             return Ok(false);
         }
 
@@ -889,12 +1207,33 @@ fn run_worker(
         )));
     }
 
+    if let (Some(plan), Some(merge_output)) = (&plan, &merge_output) {
+        let _ = tx.send(WorkerEvent::Log(format!(
+            "Combining {total} clip(s) into {}...",
+            merge_output.display()
+        )));
+        let _ = tx.send(WorkerEvent::Fps(0.0));
+        ctx.request_repaint();
+
+        let merged = finish_merge(plan, merge_output, options.mode, &options, cancel_flag)
+            .map_err(|e| format!("{e}{}", parts_note(Some(plan))))?;
+        if !merged {
+            let _ = tx.send(WorkerEvent::Log(format!(
+                "Cancelled: combining stopped.{}",
+                parts_note(Some(plan))
+            )));
+            return Ok(false);
+        }
+        let _ = tx.send(WorkerEvent::Log(format!("Done: {}", merge_output.display())));
+    }
+
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dive_overlay_core::model::Field;
     use std::path::Path;
     use std::process::Command;
 
@@ -918,6 +1257,48 @@ mod tests {
         path
     }
 
+    fn worker_config(csv_path: PathBuf, entries: Vec<ClipEntry>, fields: Vec<Field>) -> WorkerConfig {
+        WorkerConfig {
+            csv_path,
+            column_map: HashMap::new(),
+            entries,
+            options: ProcessingOptions {
+                fields,
+                codec: Codec::Auto,
+                preset: Preset::VeryFast,
+                hw_accel: false,
+                show_graph: false,
+                mode: OutputMode::Overlay,
+                interpolate: false,
+            },
+            auto_sync: None,
+            merge_output: None,
+        }
+    }
+
+    fn entry(video_path: PathBuf, csv_sync_mmss: &str, output_path: PathBuf) -> ClipEntry {
+        ClipEntry {
+            video_path,
+            video_sync_sec: 0.0,
+            csv_sync_mmss: csv_sync_mmss.to_string(),
+            output_path,
+        }
+    }
+
+    #[test]
+    fn scrubbing_stays_inside_the_clip() {
+        // Ordinary steps in both directions.
+        assert_eq!(scrubbed_video_sync(10.0, 5.0, 60.0), 15.0);
+        assert_eq!(scrubbed_video_sync(10.0, -5.0, 60.0), 5.0);
+        // Never before the first frame...
+        assert_eq!(scrubbed_video_sync(2.0, -60.0, 60.0), 0.0);
+        // ...and never past the last one, where the seek would decode nothing.
+        assert_eq!(scrubbed_video_sync(59.0, 60.0, 60.0), 59.95);
+        // No duration reported: only the lower bound can be enforced.
+        assert_eq!(scrubbed_video_sync(10.0, 600.0, 0.0), 610.0);
+        assert_eq!(scrubbed_video_sync(10.0, -600.0, 0.0), 0.0);
+    }
+
     /// Exercises the exact function `start_processing` spawns on its
     /// background thread, end to end, without going through the eframe UI.
     /// This is what a click-through of "Start processing" would
@@ -932,32 +1313,17 @@ mod tests {
         std::fs::write(&csv_path, "sample time (min),sample depth (m)\n0:00,1.0\n0:01,2.0\n").unwrap();
         let output = dir.join("out.mp4");
 
-        let entry = ClipEntry {
-            video_path: clip,
-            video_sync_sec: 0.0,
-            csv_sync_mmss: "0:00".to_string(),
-            output_path: output.clone(),
-        };
+        let config = worker_config(
+            csv_path,
+            vec![entry(clip, "0:00", output.clone())],
+            vec![Field::Time, Field::Depth],
+        );
 
         let ctx = egui::Context::default();
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
-        let result = run_worker(
-            csv_path,
-            vec![Field::Time, Field::Depth],
-            HashMap::new(),
-            vec![entry],
-            Codec::Auto,
-            Preset::VeryFast,
-            false,
-            false,
-            false,
-            OutputMode::Overlay,
-            &cancel_flag,
-            &tx,
-            &ctx,
-        );
+        let result = run_worker(config, &cancel_flag, &tx, &ctx);
 
         assert_eq!(result, Ok(true), "run_worker failed: {result:?}");
         assert!(output.exists());
@@ -983,37 +1349,77 @@ mod tests {
         std::fs::write(&csv_path, "sample time (min),sample depth (m)\n0:00,1.0\n").unwrap();
         let output = dir.join("out.mp4");
 
-        let entry = ClipEntry {
-            video_path: clip,
-            video_sync_sec: 0.0,
-            csv_sync_mmss: "0:00".to_string(),
-            output_path: output.clone(),
-        };
+        let config = worker_config(csv_path, vec![entry(clip, "0:00", output.clone())], vec![Field::Depth]);
 
         let ctx = egui::Context::default();
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel_flag = Arc::new(AtomicBool::new(true));
 
-        let result = run_worker(
-            csv_path,
-            vec![Field::Depth],
-            HashMap::new(),
-            vec![entry],
-            Codec::Auto,
-            Preset::VeryFast,
-            false,
-            false,
-            false,
-            OutputMode::Overlay,
-            &cancel_flag,
-            &tx,
-            &ctx,
-        );
+        let result = run_worker(config, &cancel_flag, &tx, &ctx);
 
         assert_eq!(result, Ok(false), "a cancelled run must not report success");
         let events: Vec<WorkerEvent> = rx.try_iter().collect();
         assert!(events
             .iter()
             .any(|e| matches!(e, WorkerEvent::Log(l) if l.contains("Cancelled"))));
+    }
+
+    /// The combine path as the GUI drives it: clips handed over in the wrong
+    /// order, joined into one file, with the scratch parts cleaned up.
+    #[test]
+    fn run_worker_combines_clips_into_one_file_in_dive_order() {
+        let dir = make_test_dir("merged");
+        let first = synth_clip(&dir, "first.mp4", 1, 10);
+        let second = synth_clip(&dir, "second.mp4", 1, 10);
+        let csv_path = dir.join("dive.csv");
+        std::fs::write(
+            &csv_path,
+            "sample time (min),sample depth (m)\n0:00,1.0\n5:00,20.0\n",
+        )
+        .unwrap();
+        let merged = dir.join("dive_full.mp4");
+
+        // Listed later-clip-first on purpose: the merge has to reorder them.
+        let mut config = worker_config(
+            csv_path,
+            vec![
+                entry(second.clone(), "5:00", dir.join("second_overlay.mp4")),
+                entry(first.clone(), "0:00", dir.join("first_overlay.mp4")),
+            ],
+            vec![Field::Time, Field::Depth],
+        );
+        config.merge_output = Some(merged.clone());
+
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        let result = run_worker(config, &cancel_flag, &tx, &ctx);
+        assert_eq!(result, Ok(true), "run_worker failed: {result:?}");
+
+        assert!(merged.exists());
+        // Only the combined file survives: no per-clip outputs, no scratch dir.
+        assert!(!dir.join("first_overlay.mp4").exists());
+        assert!(!dir.join("second_overlay.mp4").exists());
+        assert!(!dir.join("dive_full_parts").exists());
+
+        let info = probe_video(&merged).unwrap();
+        let joined = info.duration_sec.unwrap_or(0.0);
+        assert!(joined > 1.5, "expected both clips in the merged file, got {joined}s");
+
+        let logged: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                WorkerEvent::Log(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        let processed_first = logged.iter().position(|l| l.contains("first.mp4"));
+        let processed_second = logged.iter().position(|l| l.contains("second.mp4"));
+        assert!(
+            processed_first < processed_second,
+            "clips were not reordered by dive time: {logged:?}"
+        );
+        assert!(logged.iter().any(|l| l.contains("Combining 2 clip(s)")), "{logged:?}");
     }
 }

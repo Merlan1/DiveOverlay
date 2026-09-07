@@ -9,6 +9,7 @@ use clap::Parser;
 
 use dive_overlay_core::csv_data::{load_samples, parse_column_map, parse_duration_to_seconds, parse_fields};
 use dive_overlay_core::ffprobe::ensure_ffmpeg_available;
+use dive_overlay_core::merge::{finish_merge, plan_merge};
 use dive_overlay_core::pipeline::{process_clip, Codec, OutputMode, Preset, ProcessingOptions};
 use dive_overlay_core::sync::{compute_auto_sync, derive_output_path, parse_clip_spec, AutoSyncParams};
 use dive_overlay_core::ClipJob;
@@ -55,9 +56,9 @@ struct Args {
     #[arg(long, default_value = "veryfast")]
     preset: String,
 
-    /// Tries to use hardware acceleration (e.g. Intel Quick Sync) for
-    /// H264/H265; falls back to software automatically if no matching
-    /// hardware is found. Ignored for other codecs.
+    /// Tries to use hardware acceleration (Intel Quick Sync, NVIDIA NVENC,
+    /// or AMD AMF) for H264/H265; falls back to software automatically if no
+    /// matching hardware is found. Ignored for other codecs.
     #[arg(long)]
     hw_accel: bool,
 
@@ -95,6 +96,13 @@ struct Args {
     /// Can be used multiple times.
     #[arg(long = "clip")]
     clip: Vec<String>,
+
+    /// Combine every clip into a single dive video at this path. The clips
+    /// are sorted by dive time and joined back-to-back (no filler for the
+    /// gaps between them), and only the combined file is kept -- the
+    /// per-clip outputs become scratch files and are deleted afterwards.
+    #[arg(long)]
+    merge_output: Option<PathBuf>,
 }
 
 fn build_jobs(args: &Args) -> Result<Vec<ClipJob>> {
@@ -186,10 +194,20 @@ fn main() -> Result<()> {
     };
     let stop_flag = Arc::new(AtomicBool::new(false));
 
+    for job in jobs.iter_mut() {
+        job.output_path = job.output_path.with_extension("mp4");
+    }
+
+    // Redirects every job to a scratch part file and puts the jobs in dive
+    // order, so the loop below already writes the parts in merge order.
+    let merge_output = args.merge_output.as_ref().map(|path| path.with_extension("mp4"));
+    let plan = match &merge_output {
+        Some(path) => Some(plan_merge(&mut jobs, path)?),
+        None => None,
+    };
+
     let total = jobs.len();
     for (i, job) in jobs.iter_mut().enumerate() {
-        job.output_path = job.output_path.with_extension("mp4");
-
         let mut last_instant = Instant::now();
         let mut last_done: u64 = 0;
         let mut printed_progress = false;
@@ -228,12 +246,25 @@ fn main() -> Result<()> {
             },
             |info| println!("[{}/{}] Encoder: {}", i + 1, total, info.describe()),
         )
+        .map_err(|e| match &plan {
+            // The finished parts are deliberately left behind on failure so
+            // the encodes done so far aren't thrown away.
+            Some(plan) => anyhow!("{e}\nPartial results kept in: {}", plan.parts_dir.display()),
+            None => e.into(),
+        })
         .with_context(|| format!("Processing failed: {}", job.video_path.display()))?;
 
         if printed_progress {
             println!();
         }
         println!("[{}/{}] Done: {}", i + 1, total, job.output_path.display());
+    }
+
+    if let (Some(plan), Some(merge_output)) = (&plan, &merge_output) {
+        println!("Combining {total} clip(s) into {}...", merge_output.display());
+        finish_merge(plan, merge_output, mode, &options, &stop_flag)
+            .with_context(|| format!("Combining clips failed (parts kept in {})", plan.parts_dir.display()))?;
+        println!("Done: {}", merge_output.display());
     }
 
     Ok(())

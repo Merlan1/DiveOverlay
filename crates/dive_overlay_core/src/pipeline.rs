@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use image::RgbImage;
@@ -117,12 +118,7 @@ impl Preset {
 /// showing up in `ffmpeg -encoders`) does not mean the corresponding
 /// hardware/driver is actually present on the running machine -- see
 /// `probe_hw_encoder`.
-///
-/// `Amf` is unused for now (see `ENABLED_HW_CANDIDATES`) -- allowed dead code
-/// rather than deleted, since the mapping in `ffmpeg_encoder_name` below is
-/// already correct and ready to enable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum HwEncoder {
     Qsv,
     Nvenc,
@@ -152,15 +148,27 @@ impl HwEncoder {
             _ => None,
         }
     }
+
+    /// Extra `-c:v` args that pin the encoder to a fixed-quality target
+    /// instead of its default mode (which otherwise produces much larger
+    /// files than the software encoders for comparable quality). The knob
+    /// differs per backend: QSV/NVENC honor `-global_quality`, while AMF
+    /// ignores it and needs its own constant-quantization rate control.
+    fn quality_args(self) -> Vec<&'static str> {
+        match self {
+            HwEncoder::Qsv | HwEncoder::Nvenc => vec!["-global_quality", "23"],
+            HwEncoder::Amf => vec!["-rc", "cqp", "-qp_i", "23", "-qp_p", "23"],
+        }
+    }
 }
 
 /// Hardware encoders auto-detection will actually probe/try, in priority
 /// order. NVENC has been confirmed end to end on real Nvidia hardware
-/// (GeForce RTX 2070). AMF is fully implemented above (name mapping) and
-/// below (`probe_hw_encoder` works identically for all three backends), but
-/// is deliberately left out of this list until verified against real AMD
-/// hardware. Add `HwEncoder::Amf` here once confirmed on that hardware.
-const ENABLED_HW_CANDIDATES: &[HwEncoder] = &[HwEncoder::Qsv, HwEncoder::Nvenc];
+/// (GeForce RTX 2070); AMF (`h264_amf`/`hevc_amf`) has been confirmed on an
+/// AMD iGPU. `probe_hw_encoder` runs the same runtime init check for every
+/// backend, so a machine without the matching GPU simply fails the probe
+/// and falls back to software.
+const ENABLED_HW_CANDIDATES: &[HwEncoder] = &[HwEncoder::Qsv, HwEncoder::Nvenc, HwEncoder::Amf];
 
 /// Describes which concrete ffmpeg video encoder ended up being used for a
 /// job. Silently falling back from a requested hardware encoder to
@@ -188,16 +196,50 @@ impl EncoderInfo {
     }
 }
 
+/// Memoizes `run_hw_encoder_probe` per encoder *and* frame size. A
+/// multi-clip run would otherwise spawn the same probe for every job, and
+/// the answer genuinely differs per resolution (see below).
+type HwProbeCache = OnceLock<Mutex<HashMap<(&'static str, u32, u32), bool>>>;
+static HW_PROBE_CACHE: HwProbeCache = OnceLock::new();
+
 /// Probes whether `encoder_name` actually initializes on this machine by
 /// attempting a trivial fraction-of-a-second encode into ffmpeg's null
 /// muxer. This is the only reliable check: `ffmpeg -encoders` lists every
 /// backend the binary was compiled with, not the ones whose driver/hardware
 /// is actually present, and a missing/mismatched driver fails at encoder
 /// init time rather than at compile time.
-fn probe_hw_encoder(encoder_name: &str, pix_fmt: &str) -> bool {
+///
+/// The probe MUST run at the frame size the job will really encode. A
+/// hardware encoder's maximum resolution is a property of the silicon, not
+/// of the ffmpeg build: an AMD iGPU here initializes `h264_amf` happily at
+/// 4096x2304 and refuses 4608x2592 with `encoder->Init() failed with error
+/// 5`. Probing at a fixed small size therefore reported "available" and the
+/// real encode then died at init, failing the whole job -- for exactly the
+/// 5.3K GoPro footage this tool is pointed at. Sizing the probe to the job
+/// turns that into a silent, correct fallback to software.
+fn probe_hw_encoder(encoder_name: &'static str, pix_fmt: &str, width: u32, height: u32) -> bool {
+    let cache = HW_PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (encoder_name, width, height);
+    if let Ok(cache) = cache.lock() {
+        if let Some(&known) = cache.get(&key) {
+            return known;
+        }
+    }
+
+    let available = run_hw_encoder_probe(encoder_name, pix_fmt, width, height);
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, available);
+    }
+    available
+}
+
+fn run_hw_encoder_probe(encoder_name: &str, pix_fmt: &str, width: u32, height: u32) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
     Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .args(["-f", "lavfi", "-i", "nullsrc=size=320x240:rate=5:duration=0.2"])
+        .args(["-f", "lavfi", "-i", &format!("nullsrc=size={width}x{height}:rate=5:duration=0.2")])
         .args(["-frames:v", "1", "-c:v", encoder_name, "-pix_fmt", pix_fmt])
         .args(["-f", "null", "-"])
         .stdin(Stdio::null())
@@ -212,22 +254,28 @@ fn probe_hw_encoder(encoder_name: &str, pix_fmt: &str) -> bool {
 /// args to use for a job: tries `ENABLED_HW_CANDIDATES` first (if
 /// `hw_accel` was requested and the codec has a hardware path), falling
 /// back to the software codec/preset otherwise. Hardware encoders are given
-/// a fixed quality target (`-global_quality`) rather than left on their
-/// default constant-quantization mode, which otherwise produces much larger
+/// a fixed quality target (see `HwEncoder::quality_args`) rather than left
+/// on their default rate-control mode, which otherwise produces much larger
 /// files than the software encoders for comparable quality.
-fn resolve_encoder(
+///
+/// `width`/`height` are the frame size the job will encode, and are passed
+/// straight to the probe -- a hardware encoder that can't do this size is
+/// not "available" for this job, however well it does 1080p.
+pub(crate) fn resolve_encoder(
     codec: Codec,
     preset: Preset,
     hw_accel: bool,
+    width: u32,
+    height: u32,
 ) -> (&'static str, &'static str, Vec<&'static str>, EncoderInfo) {
     if hw_accel {
         for hw in ENABLED_HW_CANDIDATES {
             if let Some(name) = hw.ffmpeg_encoder_name(codec) {
-                if probe_hw_encoder(name, "nv12") {
+                if probe_hw_encoder(name, "nv12", width, height) {
                     return (
                         name,
                         "nv12",
-                        vec!["-global_quality", "23"],
+                        hw.quality_args(),
                         EncoderInfo::Hardware {
                             backend: hw.backend_label(),
                             ffmpeg_name: name,
@@ -291,7 +339,7 @@ pub struct ProcessingOptions {
 /// child never blocks on a full stderr pipe) and hands the text back via
 /// the join handle, so it can be attached to the error message if the
 /// process fails -- "exit code: 1" on its own tells a GUI user nothing.
-fn spawn_stderr_capture(mut pipe: impl Read + Send + 'static) -> JoinHandle<String> {
+pub(crate) fn spawn_stderr_capture(mut pipe: impl Read + Send + 'static) -> JoinHandle<String> {
     thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = pipe.read_to_end(&mut buf);
@@ -302,7 +350,7 @@ fn spawn_stderr_capture(mut pipe: impl Read + Send + 'static) -> JoinHandle<Stri
 /// Collects a captured stderr. On success any leftover text (warnings) is
 /// echoed to our own stderr as before; on failure it is returned so the
 /// caller can fold it into the `CoreError` instead.
-fn finish_stderr(handle: JoinHandle<String>, label: &str, succeeded: bool) -> String {
+pub(crate) fn finish_stderr(handle: JoinHandle<String>, label: &str, succeeded: bool) -> String {
     let text = handle.join().unwrap_or_default();
     if succeeded && !text.is_empty() {
         eprintln!("[{label}] {text}");
@@ -310,7 +358,7 @@ fn finish_stderr(handle: JoinHandle<String>, label: &str, succeeded: bool) -> St
     text
 }
 
-fn ffmpeg_failure(what: &str, status: std::process::ExitStatus, stderr_text: &str) -> CoreError {
+pub(crate) fn ffmpeg_failure(what: &str, status: std::process::ExitStatus, stderr_text: &str) -> CoreError {
     if stderr_text.is_empty() {
         CoreError::Ffmpeg(format!("{what} exited with error: {status}"))
     } else {
@@ -321,7 +369,7 @@ fn ffmpeg_failure(what: &str, status: std::process::ExitStatus, stderr_text: &st
 /// Best-effort absolute form of `path` for equality comparison: the real
 /// canonical path if it exists, otherwise the canonical parent joined with
 /// the file name (the output file usually doesn't exist yet).
-fn resolved_for_compare(path: &Path) -> PathBuf {
+pub(crate) fn resolved_for_compare(path: &Path) -> PathBuf {
     if let Ok(p) = path.canonicalize() {
         return p;
     }
@@ -341,7 +389,7 @@ fn resolved_for_compare(path: &Path) -> PathBuf {
 /// input, but a differently spelled path (relative vs absolute, other case
 /// on Windows) slips through and the encoder then truncates the very file
 /// the decoder is still reading. Catch that before spawning anything.
-fn ensure_output_differs_from_input(video_path: &Path, output_path: &Path) -> Result<(), CoreError> {
+pub(crate) fn ensure_output_differs_from_input(video_path: &Path, output_path: &Path) -> Result<(), CoreError> {
     let a = resolved_for_compare(video_path);
     let b = resolved_for_compare(output_path);
     let same = if cfg!(windows) {
@@ -424,7 +472,7 @@ fn spawn_encoder(
 
     let size_arg = format!("{width}x{height}");
     let fps_arg = format!("{fps}");
-    let (encoder_name, pix_fmt, extra_args, info) = resolve_encoder(codec, preset, hw_accel);
+    let (encoder_name, pix_fmt, extra_args, info) = resolve_encoder(codec, preset, hw_accel, width, height);
 
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24"])
@@ -943,12 +991,37 @@ mod tests {
 
     #[test]
     fn probe_hw_encoder_rejects_bogus_encoder_name() {
-        assert!(!probe_hw_encoder("definitely_not_a_real_encoder", "nv12"));
+        assert!(!probe_hw_encoder("definitely_not_a_real_encoder", "nv12", 320, 240));
+    }
+
+    /// The regression this guards: the probe used to run at a fixed 320x240
+    /// no matter what the job was, so a hardware encoder that tops out below
+    /// the clip's resolution was reported as available and then failed at
+    /// encoder init, taking the whole job with it. No consumer H264/HEVC
+    /// hardware encoder initializes at 16384x16384, so on any machine --
+    /// with or without a GPU -- this must resolve to software.
+    #[test]
+    fn resolve_encoder_falls_back_to_software_for_a_frame_size_no_hardware_supports() {
+        let (name, pix_fmt, _args, info) = resolve_encoder(Codec::H264, Preset::Fast, true, 16384, 16384);
+        assert_eq!(name, "libx264");
+        assert_eq!(pix_fmt, "yuv420p");
+        assert!(
+            matches!(info, EncoderInfo::Software { .. }),
+            "hardware encoder accepted an impossible frame size: {info:?}"
+        );
+    }
+
+    /// A zero frame size means ffprobe told us nothing useful; probing it
+    /// would just spawn an ffmpeg that fails, so it is rejected outright.
+    #[test]
+    fn probe_hw_encoder_rejects_a_zero_frame_size_without_spawning_ffmpeg() {
+        assert!(!probe_hw_encoder("libx264", "yuv420p", 0, 240));
+        assert!(!probe_hw_encoder("libx264", "yuv420p", 320, 0));
     }
 
     #[test]
     fn resolve_encoder_uses_software_when_hw_accel_disabled() {
-        let (name, pix_fmt, args, info) = resolve_encoder(Codec::H264, Preset::Fast, false);
+        let (name, pix_fmt, args, info) = resolve_encoder(Codec::H264, Preset::Fast, false, 1920, 1080);
         assert_eq!(name, "libx264");
         assert_eq!(pix_fmt, "yuv420p");
         assert_eq!(args, vec!["-preset", "fast"]);
@@ -965,7 +1038,7 @@ mod tests {
     fn resolve_encoder_ignores_hw_accel_for_codecs_without_a_hardware_path() {
         // mpeg4/xvid/mjpeg have no hardware encoder in any backend, so
         // hw_accel=true must still resolve to the software encoder.
-        let (name, pix_fmt, args, info) = resolve_encoder(Codec::Mpeg4, Preset::VeryFast, true);
+        let (name, pix_fmt, args, info) = resolve_encoder(Codec::Mpeg4, Preset::VeryFast, true, 1920, 1080);
         assert_eq!(name, "mpeg4");
         assert_eq!(pix_fmt, "yuv420p");
         assert!(args.is_empty());
@@ -976,6 +1049,28 @@ mod tests {
                 preset: None
             }
         ));
+    }
+
+    #[test]
+    fn hw_encoder_maps_amf_names_and_quality_args() {
+        assert_eq!(
+            HwEncoder::Amf.ffmpeg_encoder_name(Codec::Auto),
+            Some("h264_amf")
+        );
+        assert_eq!(
+            HwEncoder::Amf.ffmpeg_encoder_name(Codec::H265),
+            Some("hevc_amf")
+        );
+        // AMF ignores -global_quality; it needs its own CQP rate control.
+        assert_eq!(
+            HwEncoder::Amf.quality_args(),
+            vec!["-rc", "cqp", "-qp_i", "23", "-qp_p", "23"]
+        );
+        assert_eq!(
+            HwEncoder::Qsv.quality_args(),
+            vec!["-global_quality", "23"]
+        );
+        assert!(ENABLED_HW_CANDIDATES.contains(&HwEncoder::Amf));
     }
 
     #[test]
@@ -1014,16 +1109,22 @@ mod tests {
     /// failing on hardware this crate cannot assume is present.
     #[test]
     fn processes_synthetic_clip_with_hw_accel_when_available() {
-        if !ENABLED_HW_CANDIDATES
-            .iter()
-            .any(|hw| hw.ffmpeg_encoder_name(Codec::Auto).is_some_and(|name| probe_hw_encoder(name, "nv12")))
-        {
+        // 320x240, not the usual 160x120: AMF rejects very small frames at
+        // encoder init (error 5). The probe below uses the same size as the
+        // fixture, exactly as a real job does.
+        const W: u32 = 320;
+        const H: u32 = 240;
+
+        if !ENABLED_HW_CANDIDATES.iter().any(|hw| {
+            hw.ffmpeg_encoder_name(Codec::Auto)
+                .is_some_and(|name| probe_hw_encoder(name, "nv12", W, H))
+        }) {
             eprintln!("skipping processes_synthetic_clip_with_hw_accel_when_available: no working hw encoder here");
             return;
         }
 
         let dir = make_test_dir("hw_accel");
-        let clip = synth_clip(&dir, "input.mp4", 2, 5);
+        let clip = synth_clip_res(&dir, "input.mp4", W, H, 2, 5);
         let output = dir.join("output.mp4");
 
         let job = ClipJob {
@@ -1058,8 +1159,12 @@ mod tests {
     }
 
     fn synth_clip(dir: &Path, name: &str, duration_secs: u32, fps: u32) -> PathBuf {
+        synth_clip_res(dir, name, 160, 120, duration_secs, fps)
+    }
+
+    fn synth_clip_res(dir: &Path, name: &str, w: u32, h: u32, duration_secs: u32, fps: u32) -> PathBuf {
         let path = dir.join(name);
-        let video_src = format!("testsrc=size=160x120:rate={fps}:duration={duration_secs}");
+        let video_src = format!("testsrc=size={w}x{h}:rate={fps}:duration={duration_secs}");
         let audio_src = format!("sine=frequency=440:duration={duration_secs}");
         let status = Command::new("ffmpeg")
             .args(["-y", "-f", "lavfi", "-i", &video_src, "-f", "lavfi", "-i", &audio_src])

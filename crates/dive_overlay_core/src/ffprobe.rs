@@ -72,6 +72,10 @@ pub struct VideoInfo {
     /// first) -- used for sizing subtitle-cue generation, where we need the
     /// actual runtime rather than a frame-count estimate.
     pub duration_sec: Option<f64>,
+    /// Whether the file carries at least one audio stream. Merging needs it:
+    /// clips with and without audio cannot be joined by a stream copy, and
+    /// the re-encode path has to synthesize silence for the silent ones.
+    pub has_audio: bool,
 }
 
 /// Fails fast with a clear message if ffmpeg/ffprobe aren't on PATH, instead
@@ -186,6 +190,11 @@ fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
         .or_else(|| parsed.format.as_ref().and_then(|f| f.duration.as_deref()))
         .and_then(|s| s.parse::<f64>().ok());
 
+    let has_audio = parsed
+        .streams
+        .iter()
+        .any(|s| s.codec_type.as_deref() == Some("audio"));
+
     Ok(VideoInfo {
         width,
         height,
@@ -194,6 +203,7 @@ fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
         estimated_frames,
         creation_time,
         duration_sec,
+        has_audio,
     })
 }
 
@@ -253,6 +263,7 @@ mod tests {
         assert_eq!(info.fps, 30.0);
         assert_eq!(info.estimated_frames, Some(150));
         assert!(info.creation_time.is_some());
+        assert!(info.has_audio);
     }
 
     #[test]
@@ -264,6 +275,7 @@ mod tests {
         let info = parse_ffprobe_json(json.as_bytes()).unwrap();
         assert_eq!(info.estimated_frames, Some(50));
         assert!(info.creation_time.is_none());
+        assert!(!info.has_audio);
     }
 
     #[test]
