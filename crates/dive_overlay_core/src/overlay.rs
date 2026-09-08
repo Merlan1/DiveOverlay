@@ -165,6 +165,10 @@ struct CachedTile {
     lines: Vec<String>,
     x: i32,
     y: i32,
+    /// Stands in for the whole `OverlayMetrics` in the cache key, since the
+    /// rest is derived from it: a tile rendered for one frame size must not
+    /// be reused at another.
+    line_height: i32,
     image: RgbaImage,
 }
 
@@ -174,14 +178,58 @@ impl OverlayCache {
     }
 }
 
+/// Line height in pixels: 4.5% of the frame height, floored so a very small
+/// frame still gets legible text. Every other overlay size is pinned to this
+/// one, so it doubles as the frame-relative scale factor (see
+/// `OverlayMetrics`).
+fn line_height_for(height: u32) -> i32 {
+    ((height as f64 * 0.045) as i32).max(MIN_LINE_HEIGHT)
+}
+
+const MIN_LINE_HEIGHT: i32 = 24;
+/// What `line_height_for` returns at 1080p (1080 * 0.045, truncated), where
+/// the overlay's sizes were originally hand-tuned.
+const REFERENCE_LINE_HEIGHT: f32 = 48.0;
+
+/// Frame-relative sizing for the info box.
+///
+/// The overlay's proportions were hand-tuned at roughly 1080p, but only the
+/// line height was ever expressed as a fraction of the frame -- the font and
+/// padding were hard-coded pixel counts. On 5.3K footage the box therefore
+/// grew to 134px per line while the glyphs stayed 22px: far too small to
+/// read, and mushy once a player scales the picture back down. Deriving
+/// every size from one factor keeps the overlay the same fraction of the
+/// picture at any resolution, and by construction leaves the 1080p rendering
+/// byte-identical to what it was.
+struct OverlayMetrics {
+    line_height: i32,
+    font: PxScale,
+    padding: i32,
+}
+
+impl OverlayMetrics {
+    fn for_frame(height: u32) -> Self {
+        let line_height = line_height_for(height);
+        let scale = line_height as f32 / REFERENCE_LINE_HEIGHT;
+        Self {
+            line_height,
+            // Floored for the same reason as the line height: below roughly
+            // 800px tall, strict proportionality would shrink the text past
+            // readable, so legibility wins over exact scaling there.
+            font: PxScale::from((22.0 * scale).max(16.0)),
+            padding: (14.0 * scale).max(6.0).round() as i32,
+        }
+    }
+}
+
 /// Renders `lines` into a standalone RGBA tile: a translucent background
 /// (alpha baked in, matching the 0.45 opacity `blend_rect_alpha` used to
 /// apply directly) with opaque text drawn on top. The tile carries its own
 /// alpha channel so it can be composited onto any frame later without
 /// redoing font/text work.
-fn render_tile(lines: &[String], x: i32, y: i32, line_height: i32) -> CachedTile {
-    let padding: i32 = 14;
-    let scale = PxScale::from(22.0);
+fn render_tile(lines: &[String], x: i32, y: i32, metrics: &OverlayMetrics) -> CachedTile {
+    let padding = metrics.padding;
+    let scale = metrics.font;
     let font = font();
 
     let box_w = lines
@@ -190,7 +238,7 @@ fn render_tile(lines: &[String], x: i32, y: i32, line_height: i32) -> CachedTile
         .max()
         .unwrap_or(0)
         + padding * 2;
-    let box_h = line_height * lines.len() as i32 + padding;
+    let box_h = metrics.line_height * lines.len() as i32 + padding;
 
     let bg_alpha = (0.45_f32 * 255.0).round() as u8;
     let mut tile = RgbaImage::from_pixel(box_w.max(1) as u32, box_h.max(1) as u32, Rgba([20, 20, 20, bg_alpha]));
@@ -198,13 +246,14 @@ fn render_tile(lines: &[String], x: i32, y: i32, line_height: i32) -> CachedTile
     let mut text_y = padding / 2;
     for line in lines {
         draw_text_mut(&mut tile, Rgba([230, 245, 255, 255]), padding, text_y, scale, font, line);
-        text_y += line_height;
+        text_y += metrics.line_height;
     }
 
     CachedTile {
         lines: lines.to_vec(),
         x,
         y,
+        line_height: metrics.line_height,
         image: tile,
     }
 }
@@ -242,18 +291,67 @@ pub fn draw_overlay(img: &mut RgbImage, lines: &[String], cache: &mut OverlayCac
     let (w, h) = img.dimensions();
     let x = (w as f64 * 0.04) as i32;
     let y = (h as f64 * 0.06) as i32;
-    let line_height = ((h as f64 * 0.045) as i32).max(24);
+    let metrics = OverlayMetrics::for_frame(h);
 
     let needs_render = match &cache.tile {
-        Some(cached) => cached.x != x || cached.y != y || cached.lines.as_slice() != lines,
+        Some(cached) => {
+            cached.x != x
+                || cached.y != y
+                || cached.line_height != metrics.line_height
+                || cached.lines.as_slice() != lines
+        }
         None => true,
     };
     if needs_render {
-        cache.tile = Some(render_tile(lines, x, y, line_height));
+        cache.tile = Some(render_tile(lines, x, y, &metrics));
     }
 
     if let Some(cached) = &cache.tile {
         composite_tile(img, &cached.image, cached.x, cached.y);
+    }
+}
+
+/// Frame-relative sizing for the depth graph, on the same factor as
+/// `OverlayMetrics` -- its axis labels were a hard-coded 14px and its strokes
+/// a single pixel, which is invisible on a 5K frame.
+struct GraphMetrics {
+    font: PxScale,
+    inset: i32,
+    stroke: i32,
+}
+
+impl GraphMetrics {
+    fn for_frame(height: u32) -> Self {
+        let scale = line_height_for(height) as f32 / REFERENCE_LINE_HEIGHT;
+        Self {
+            font: PxScale::from((14.0 * scale).max(11.0)),
+            inset: (4.0 * scale).max(2.0).round() as i32,
+            stroke: (scale.round() as i32).max(1),
+        }
+    }
+}
+
+/// `draw_line_segment_mut` draws a single pixel wide. The depth profile runs
+/// left to right, so stacking the segment vertically thickens it without the
+/// stair-stepping a naive perpendicular offset would give on a near-flat line.
+fn draw_thick_line(img: &mut RgbImage, a: (f32, f32), b: (f32, f32), color: Rgb<u8>, thickness: i32) {
+    let half = (thickness - 1) as f32 / 2.0;
+    for i in 0..thickness {
+        let dy = i as f32 - half;
+        draw_line_segment_mut(img, (a.0, a.1 + dy), (b.0, b.1 + dy), color);
+    }
+}
+
+/// Same idea for the graph's border: nested one-pixel rectangles, inset one
+/// step at a time, so it stays visible as the frame grows.
+fn draw_thick_hollow_rect(img: &mut RgbImage, x: i32, y: i32, w: u32, h: u32, color: Rgb<u8>, thickness: i32) {
+    for i in 0..thickness {
+        let inset = i as u32;
+        if w <= inset * 2 || h <= inset * 2 {
+            break;
+        }
+        let rect = Rect::at(x + i, y + i).of_size(w - inset * 2, h - inset * 2);
+        draw_hollow_rect_mut(img, rect, color);
     }
 }
 
@@ -289,9 +387,11 @@ pub fn draw_depth_graph(img: &mut RgbImage, samples: &[DiveSample], times: &[f64
         max_depth = min_depth + 1.0;
     }
 
+    let metrics = GraphMetrics::for_frame(h);
+
     blend_rect_alpha(img, x, y, graph_w, graph_h, Rgb([10, 10, 10]), 0.35);
     if graph_w > 0 && graph_h > 0 {
-        draw_hollow_rect_mut(img, Rect::at(x, y).of_size(graph_w, graph_h), Rgb([90, 90, 90]));
+        draw_thick_hollow_rect(img, x, y, graph_w, graph_h, Rgb([90, 90, 90]), metrics.stroke);
     }
 
     let mut points: Vec<(f32, f32)> = Vec::new();
@@ -309,21 +409,30 @@ pub fn draw_depth_graph(img: &mut RgbImage, samples: &[DiveSample], times: &[f64
     }
 
     for pair in points.windows(2) {
-        draw_line_segment_mut(img, pair[0], pair[1], Rgb([100, 220, 255]));
+        draw_thick_line(img, pair[0], pair[1], Rgb([100, 220, 255]), metrics.stroke);
     }
 
-    let axis_scale = PxScale::from(14.0);
+    let axis_scale = metrics.font;
     let axis_font = font();
+    let label_inset = metrics.inset;
     let max_label = format!("{max_depth:.1}m");
     let min_label = format!("{min_depth:.1}m");
     let (_, min_label_h) = text_size(axis_scale, axis_font, &min_label);
     // min_depth (shallowest) plots at the top of the box, max_depth (deepest) at the bottom.
-    draw_text_mut(img, Rgb([200, 200, 200]), x + 4, y + 2, axis_scale, axis_font, &min_label);
     draw_text_mut(
         img,
         Rgb([200, 200, 200]),
-        x + 4,
-        y + graph_h as i32 - min_label_h as i32 - 2,
+        x + label_inset,
+        y + label_inset / 2,
+        axis_scale,
+        axis_font,
+        &min_label,
+    );
+    draw_text_mut(
+        img,
+        Rgb([200, 200, 200]),
+        x + label_inset,
+        y + graph_h as i32 - min_label_h as i32 - label_inset / 2,
         axis_scale,
         axis_font,
         &max_label,
@@ -453,5 +562,77 @@ mod tests {
         let samples = vec![sample(0.0, 1.0), sample(5.0, 3.0), sample(10.0, 2.0)];
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
         draw_depth_graph(&mut img, &samples, &times, 10.0, 600.0);
+    }
+
+    /// 1080p is the resolution the overlay's sizes were hand-tuned at, so
+    /// making them frame-relative must leave it exactly as it was.
+    #[test]
+    fn metrics_at_1080p_match_the_hand_tuned_originals() {
+        let metrics = OverlayMetrics::for_frame(1080);
+        assert_eq!(metrics.line_height, 48);
+        assert_eq!(metrics.font.x, 22.0);
+        assert_eq!(metrics.padding, 14);
+
+        let graph = GraphMetrics::for_frame(1080);
+        assert_eq!(graph.font.x, 14.0);
+        assert_eq!(graph.inset, 4);
+        assert_eq!(graph.stroke, 1);
+    }
+
+    /// The regression: the font used to be a hard-coded 22px at every
+    /// resolution, so a 5.3K frame got a 134px-tall line with 22px glyphs in
+    /// it. Text must grow with the box, keeping the ratio it has at 1080p.
+    #[test]
+    fn text_scales_with_the_frame_instead_of_staying_22px() {
+        let reference = OverlayMetrics::for_frame(1080);
+        let gopro_5k = OverlayMetrics::for_frame(2988);
+
+        let box_growth = gopro_5k.line_height as f32 / reference.line_height as f32;
+        let font_growth = gopro_5k.font.x / reference.font.x;
+        assert!(box_growth > 2.5, "fixture should be a much taller frame: {box_growth}");
+        assert!(
+            (font_growth - box_growth).abs() < 0.01,
+            "font grew {font_growth}x while the box grew {box_growth}x -- they must stay in step"
+        );
+        assert!(gopro_5k.padding > reference.padding);
+
+        // The graph's labels and strokes ride the same factor.
+        let graph = GraphMetrics::for_frame(2988);
+        assert!((graph.font.x / GraphMetrics::for_frame(1080).font.x - box_growth).abs() < 0.01);
+        assert!(graph.stroke >= 3, "a 1px stroke is invisible at 5K: {}", graph.stroke);
+    }
+
+    /// Below roughly 800px tall, strict proportionality would shrink the text
+    /// past readable, so both fonts hold at a floor -- the same trade the
+    /// line height already made with `MIN_LINE_HEIGHT`.
+    #[test]
+    fn text_stops_shrinking_on_very_small_frames() {
+        let tiny = OverlayMetrics::for_frame(120);
+        assert_eq!(tiny.line_height, MIN_LINE_HEIGHT);
+        assert_eq!(tiny.font.x, 16.0);
+        assert!(tiny.padding >= 6);
+        assert!(GraphMetrics::for_frame(120).font.x >= 11.0);
+    }
+
+    /// The cached tile is keyed on the frame's line height too: a tile
+    /// rendered for one resolution has the wrong font baked into it for
+    /// another.
+    #[test]
+    fn cached_tile_is_rerendered_when_the_frame_size_changes() {
+        let lines = vec!["Depth: 1.5 m".to_string()];
+        let mut cache = OverlayCache::new();
+
+        let mut small = RgbImage::new(320, 240);
+        draw_overlay(&mut small, &lines, &mut cache);
+        let small_tile = cache.tile.as_ref().unwrap().image.dimensions();
+
+        let mut large = RgbImage::new(5312, 2988);
+        draw_overlay(&mut large, &lines, &mut cache);
+        let large_tile = cache.tile.as_ref().unwrap().image.dimensions();
+
+        assert!(
+            large_tile.0 > small_tile.0 && large_tile.1 > small_tile.1,
+            "tile was not re-rendered for the larger frame: {small_tile:?} -> {large_tile:?}"
+        );
     }
 }

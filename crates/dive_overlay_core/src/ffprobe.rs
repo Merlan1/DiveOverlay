@@ -25,6 +25,8 @@ struct StreamInfo {
     duration: Option<String>,
     #[serde(default)]
     side_data_list: Vec<SideData>,
+    #[serde(default)]
+    tags: HashMap<String, String>,
 }
 
 /// Only the "Display Matrix" entry is of interest: its `rotation` (in
@@ -67,11 +69,26 @@ pub struct VideoInfo {
     /// never as a decode loop's termination condition.
     pub estimated_frames: Option<u64>,
     pub creation_time: Option<DateTime<Utc>>,
+    /// Start-of-recording timecode from the file's `tmcd` track, as
+    /// seconds since local midnight. GoPro (and most action/cinema cameras)
+    /// stamp the time of day at record start here from the camera's RTC,
+    /// at frame resolution -- whereas `creation_time` is quantized to whole
+    /// seconds, so this is the more precise of the two clocks for measuring
+    /// how far apart two clips of the same dive started.
+    ///
+    /// `None` when the file has no timecode or the camera's clock was never
+    /// set (`00:00:00:00`). Being a time of *day*, it carries no date and
+    /// wraps at midnight -- callers comparing two clips must handle that.
+    pub timecode_sec: Option<f64>,
     /// Container/stream duration in seconds, when ffprobe reports one.
     /// Independent of `estimated_frames` (which derives from `nb_frames`
     /// first) -- used for sizing subtitle-cue generation, where we need the
     /// actual runtime rather than a frame-count estimate.
     pub duration_sec: Option<f64>,
+    /// Whether the file carries at least one audio stream. Merging needs it:
+    /// clips with and without audio cannot be joined by a stream copy, and
+    /// the re-encode path has to synthesize silence for the silent ones.
+    pub has_audio: bool,
 }
 
 /// Fails fast with a clear message if ffmpeg/ffprobe aren't on PATH, instead
@@ -117,13 +134,55 @@ pub fn parse_creation_time(text: &str) -> Result<DateTime<Utc>, CoreError> {
         }
     }
 
-    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(text, fmt) {
             return Ok(DateTime::from_naive_utc_and_offset(naive, Utc));
         }
     }
 
-    Err(CoreError::Ffprobe(format!("Unknown creation_time format: {text}")))
+    Err(CoreError::Ffprobe(format!(
+        "Unknown creation_time format: {text}"
+    )))
+}
+
+/// Parses an `HH:MM:SS:FF` (or `;FF` for drop-frame) SMPTE timecode into
+/// seconds since midnight, using `nominal_fps` for the frames field.
+///
+/// The frames field is counted at the *nominal* rate (30 for 30000/1001
+/// footage), hence the caller rounding its real fps. Drop-frame vs
+/// non-drop only affects how a timecode *advances* through a clip; we read
+/// the start value, which each clip gets stamped freshly from the camera's
+/// clock, so no 1000/1001 correction applies here.
+///
+/// `00:00:00:00` returns `None`: that is what a camera with an unset clock
+/// writes, and treating it as "midnight" would place the clip 12 hours from
+/// every real timecode.
+pub fn parse_timecode_seconds(text: &str, nominal_fps: f64) -> Option<f64> {
+    let text = text.trim();
+    let parts: Vec<&str> = text.split([':', ';']).collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let hours: u32 = parts[0].parse().ok()?;
+    let minutes: u32 = parts[1].parse().ok()?;
+    let seconds: u32 = parts[2].parse().ok()?;
+    let frames: u32 = parts[3].parse().ok()?;
+    if hours > 23 || minutes > 59 || seconds > 59 {
+        return None;
+    }
+    if hours == 0 && minutes == 0 && seconds == 0 && frames == 0 {
+        return None;
+    }
+    let fps = if nominal_fps.is_finite() && nominal_fps >= 1.0 {
+        nominal_fps
+    } else {
+        30.0
+    };
+    Some((hours * 3600 + minutes * 60 + seconds) as f64 + frames as f64 / fps)
 }
 
 fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
@@ -180,11 +239,28 @@ fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
         .and_then(|f| f.tags.get("creation_time"))
         .and_then(|s| parse_creation_time(s).ok());
 
+    // The timecode tag is normally written to every stream (video, audio
+    // and the `tmcd` track itself), but only the video stream's nominal
+    // frame rate is meaningful for the frames field, so prefer that one and
+    // fall back to whichever other stream carries it.
+    let nominal_fps = fps.round();
+    let timecode_sec = video_stream
+        .tags
+        .get("timecode")
+        .or_else(|| parsed.streams.iter().find_map(|s| s.tags.get("timecode")))
+        .or_else(|| parsed.format.as_ref().and_then(|f| f.tags.get("timecode")))
+        .and_then(|tc| parse_timecode_seconds(tc, nominal_fps));
+
     let duration_sec = video_stream
         .duration
         .as_deref()
         .or_else(|| parsed.format.as_ref().and_then(|f| f.duration.as_deref()))
         .and_then(|s| s.parse::<f64>().ok());
+
+    let has_audio = parsed
+        .streams
+        .iter()
+        .any(|s| s.codec_type.as_deref() == Some("audio"));
 
     Ok(VideoInfo {
         width,
@@ -193,7 +269,9 @@ fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
         fps,
         estimated_frames,
         creation_time,
+        timecode_sec,
         duration_sec,
+        has_audio,
     })
 }
 
@@ -213,8 +291,9 @@ pub fn probe_video(video_path: &Path) -> Result<VideoInfo, CoreError> {
 
 pub fn get_video_creation_time_utc(video_path: &Path) -> Result<DateTime<Utc>, CoreError> {
     let info = probe_video(video_path)?;
-    info.creation_time
-        .ok_or_else(|| CoreError::Ffprobe(format!("No creation_time in MP4: {}", video_path.display())))
+    info.creation_time.ok_or_else(|| {
+        CoreError::Ffprobe(format!("No creation_time in MP4: {}", video_path.display()))
+    })
 }
 
 #[cfg(test)]
@@ -253,6 +332,7 @@ mod tests {
         assert_eq!(info.fps, 30.0);
         assert_eq!(info.estimated_frames, Some(150));
         assert!(info.creation_time.is_some());
+        assert!(info.has_audio);
     }
 
     #[test]
@@ -264,6 +344,7 @@ mod tests {
         let info = parse_ffprobe_json(json.as_bytes()).unwrap();
         assert_eq!(info.estimated_frames, Some(50));
         assert!(info.creation_time.is_none());
+        assert!(!info.has_audio);
     }
 
     #[test]
@@ -335,6 +416,52 @@ mod tests {
         assert!(parse_creation_time("2025-07-05T15:30:00+00:00").is_ok());
         assert!(parse_creation_time("2025-07-05 15:30:00").is_ok());
         assert!(parse_creation_time("not-a-date").is_err());
+    }
+
+    #[test]
+    fn parses_timecode_at_the_nominal_frame_rate() {
+        // The HERO11 footage this was built against: 29.97 fps rounds to a
+        // nominal 30 for the frames field.
+        let tc = parse_timecode_seconds("12:40:24:19", 30.0).unwrap();
+        assert!((tc - (12.0 * 3600.0 + 40.0 * 60.0 + 24.0 + 19.0 / 30.0)).abs() < 1e-6);
+
+        // Drop-frame notation uses a semicolon before the frames field.
+        assert_eq!(parse_timecode_seconds("01:00:00;00", 30.0), Some(3600.0));
+
+        // An unset camera clock writes all zeroes; treating that as midnight
+        // would place the clip 12 hours from every real timecode.
+        assert_eq!(parse_timecode_seconds("00:00:00:00", 30.0), None);
+
+        assert_eq!(parse_timecode_seconds("not a timecode", 30.0), None);
+        assert_eq!(parse_timecode_seconds("10:00:00", 30.0), None);
+        assert_eq!(parse_timecode_seconds("25:00:00:00", 30.0), None);
+    }
+
+    #[test]
+    fn reads_the_start_timecode_from_a_real_clip() {
+        let dir = std::env::temp_dir().join("dive_overlay_ffprobe_test_timecode");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tc.mp4");
+
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=30:duration=1",
+            ])
+            .args(["-timecode", "12:40:24:19"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let info = probe_video(&path).unwrap();
+        let tc = info.timecode_sec.expect("no timecode read back");
+        assert!((tc - (12.0 * 3600.0 + 40.0 * 60.0 + 24.0 + 19.0 / 30.0)).abs() < 0.05);
     }
 
     #[test]

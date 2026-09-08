@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 
-use crate::csv_data::{parse_duration_to_seconds, read_csv_datetime_columns, read_first_row_columns};
+use crate::csv_data::parse_duration_to_seconds;
 use crate::error::CoreError;
-use crate::ffprobe::get_video_creation_time_utc;
+use crate::ffprobe::{probe_video, VideoInfo};
 use crate::model::ClipJob;
 
 pub fn derive_output_path(video_path: &Path, output: Option<PathBuf>) -> PathBuf {
@@ -28,9 +27,9 @@ pub fn parse_clip_spec(spec: &str) -> Result<ClipJob, CoreError> {
     }
 
     let video_path = PathBuf::from(parts[0]);
-    let video_sync_sec: f64 = parts[1]
-        .parse()
-        .map_err(|_| CoreError::InvalidClipSpec(format!("Invalid video_sync_sec in --clip: {}", parts[1])))?;
+    let video_sync_sec: f64 = parts[1].parse().map_err(|_| {
+        CoreError::InvalidClipSpec(format!("Invalid video_sync_sec in --clip: {}", parts[1]))
+    })?;
     let csv_sync_sec = parse_duration_to_seconds(parts[2])?;
     let output_path = if parts.len() == 4 {
         PathBuf::from(parts[3])
@@ -68,74 +67,198 @@ pub fn parse_datetime_text(value: &str) -> Result<DateTime<Utc>, CoreError> {
     parse_naive_utc(value)
 }
 
+/// Which of a video file's two clocks auto-sync measured the clips against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipStartSource {
+    /// The `tmcd` start timecode -- time of day at record start, stamped
+    /// from the camera's real-time clock at frame resolution. Preferred,
+    /// because `creation_time` is quantized to whole seconds and so can be
+    /// most of a second off per clip, which a dive overlay shows.
+    Timecode,
+    /// The container's `creation_time` tag, used when any clip lacks a
+    /// usable timecode.
+    CreationTime,
+}
+
+impl ClipStartSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ClipStartSource::Timecode => "start timecode",
+            ClipStartSource::CreationTime => "creation time",
+        }
+    }
+}
+
 pub struct AutoSyncParams<'a> {
     pub base_clip: &'a Path,
     pub base_video_sync_sec: f64,
-    pub base_csv_datetime: &'a str,
 }
 
-/// Auto-computes per-clip `csv_sync_sec` from each video's MP4
-/// `creation_time` relative to one manually-synced base clip, so multi-clip
-/// dive sessions with real-world gaps between clips sync automatically.
+/// Outcome of `compute_auto_sync`: which clock supplied the deltas, plus any
+/// clip whose derived position looks wrong -- most likely because it belongs
+/// to a different dive than the CSV.
+#[derive(Debug)]
+pub struct AutoSyncReport {
+    pub source: ClipStartSource,
+    pub warnings: Vec<String>,
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Elapsed seconds between two times of day, assuming both clips belong to
+/// one dive and so are far less than 12 hours apart. A start timecode
+/// carries no date, so a dive spanning midnight would otherwise read as a
+/// ~24 hour jump backwards.
+fn timecode_delta(from: f64, to: f64) -> f64 {
+    const DAY: f64 = 86_400.0;
+    let delta = to - from;
+    if delta < -DAY / 2.0 {
+        delta + DAY
+    } else if delta > DAY / 2.0 {
+        delta - DAY
+    } else {
+        delta
+    }
+}
+
+/// `m:ss` for warning text, keeping the sign for clips landing before the
+/// dive log starts.
+fn format_signed_duration(seconds: f64) -> String {
+    let sign = if seconds < 0.0 { "-" } else { "" };
+    let total = seconds.abs().round() as u64;
+    format!("{sign}{}:{:02}", total / 60, total % 60)
+}
+
+/// Auto-computes every clip's `csv_sync_sec` from how much later it started
+/// recording than one manually-synced base clip.
+///
+/// The base clip's own `csv_sync_sec` -- entered by hand, exactly as in
+/// single-clip mode -- is the anchor, so neither the user nor the CSV has to
+/// supply a wall-clock date/time: only the *delta* between two clips of the
+/// same camera is read from the files, and a delta needs no shared epoch.
+/// (An earlier version took an absolute CSV datetime and converted it to
+/// dive-elapsed via the CSV's date/clock columns. That was redundant with
+/// the base clip's manual sync, and locked auto-sync out of dive computers
+/// that export elapsed time only.)
+///
+/// Deltas come from the `tmcd` start timecode when *every* clip has one, and
+/// from `creation_time` otherwise. The choice is all-or-nothing on purpose:
+/// the two are independent clocks that can sit tens of seconds apart within
+/// a single camera (~45 s on the HERO11 footage this was built against), so
+/// falling back per-clip would silently inject that gap into one clip's
+/// sync.
 ///
 /// Preserves the original's exact (slightly surprising) behavior: every job
 /// receives the *same* `video_sync_sec`, copied verbatim from
-/// `base_video_sync_sec` -- only `csv_sync_sec` varies per clip via the
-/// creation-time delta. This is intentional, not a bug to fix: the
-/// original assumes every clip's manual sync point sits at the same video
-/// second (e.g. "point the camera at the dive computer for the first few
-/// seconds of every clip").
+/// `base_video_sync_sec` -- only `csv_sync_sec` varies per clip. This is
+/// intentional, not a bug to fix: it assumes every clip's manual sync point
+/// sits at the same video second (e.g. "point the camera at the dive
+/// computer for the first few seconds of every clip").
 ///
-/// `column_map` supplies the `date=`/`clock=` overrides from `--column-map`
-/// (and `time=`, used to keep the elapsed-time column out of the clock
-/// heuristic); pass an empty map for pure auto-detection.
+/// `dive_times` is the CSV's elapsed-second column, used only to flag clips
+/// landing outside the dive; pass an empty slice to skip that check.
 pub fn compute_auto_sync(
-    csv_path: &Path,
-    column_map: &HashMap<String, String>,
     jobs: &mut [ClipJob],
+    dive_times: &[f64],
     params: &AutoSyncParams,
-) -> Result<(), CoreError> {
+) -> Result<AutoSyncReport, CoreError> {
     let base_clip_resolved = params
         .base_clip
         .canonicalize()
         .unwrap_or_else(|_| params.base_clip.to_path_buf());
-    let base_job_video_path = jobs
+    let base_index = jobs
         .iter()
-        .find(|j| {
-            let resolved = j.video_path.canonicalize().unwrap_or_else(|_| j.video_path.clone());
+        .position(|j| {
+            let resolved = j
+                .video_path
+                .canonicalize()
+                .unwrap_or_else(|_| j.video_path.clone());
             resolved == base_clip_resolved
         })
-        .map(|j| j.video_path.clone())
-        .ok_or_else(|| CoreError::Other("--base-clip must be one of the --clip paths".to_string()))?;
+        .ok_or_else(|| {
+            CoreError::Other("--base-clip must be one of the --clip paths".to_string())
+        })?;
 
-    let base_video_start = get_video_creation_time_utc(&base_job_video_path)?;
-    let base_csv_dt = parse_datetime_text(params.base_csv_datetime)?;
+    let infos: Vec<VideoInfo> = jobs
+        .iter()
+        .map(|job| probe_video(&job.video_path))
+        .collect::<Result<_, _>>()?;
 
-    let (date_col, clock_col) = read_csv_datetime_columns(csv_path, column_map)?;
-    let (date_col, clock_col) = match (date_col, clock_col) {
-        (Some(d), Some(c)) => (d, c),
-        _ => {
-            return Err(CoreError::Other(
-                "CSV needs date and time columns for auto-sync (use --column-map date=...,clock=... to name them)"
-                    .to_string(),
-            ))
-        }
+    let source = if infos.iter().all(|i| i.timecode_sec.is_some()) {
+        ClipStartSource::Timecode
+    } else {
+        ClipStartSource::CreationTime
     };
 
-    let first_row = read_first_row_columns(csv_path, &[&date_col, &clock_col])?
-        .ok_or_else(|| CoreError::Other("CSV contains no rows".to_string()))?;
-    let first_dt = parse_datetime_utc(&first_row[0], &first_row[1])?;
-    let base_csv_dt_offset_sec = (base_csv_dt - first_dt).num_milliseconds() as f64 / 1000.0;
+    let base_timecode = infos[base_index].timecode_sec;
+    let base_creation = infos[base_index].creation_time;
+    // The base clip's hand-entered CSV sync is the anchor every other clip
+    // is offset from.
+    let base_csv_sync_sec = jobs[base_index].csv_sync_sec;
 
-    for job in jobs.iter_mut() {
-        let video_start = get_video_creation_time_utc(&job.video_path)?;
-        let delta_sec = (video_start - base_video_start).num_milliseconds() as f64 / 1000.0;
-        job.video_start_utc = Some(video_start);
+    let mut warnings = Vec::new();
+    let dive_range = dive_times.first().copied().zip(dive_times.last().copied());
+
+    for (idx, job) in jobs.iter_mut().enumerate() {
+        let info = &infos[idx];
+        let delta_sec = match source {
+            // `source` is Timecode only when every clip has one.
+            ClipStartSource::Timecode => {
+                timecode_delta(base_timecode.unwrap(), info.timecode_sec.unwrap())
+            }
+            ClipStartSource::CreationTime => {
+                let start = info.creation_time.ok_or_else(|| {
+                    CoreError::Ffprobe(format!(
+                        "No start timecode and no creation_time in {} -- auto-sync needs one of them to place the clip",
+                        file_label(&job.video_path)
+                    ))
+                })?;
+                let base_start = base_creation.ok_or_else(|| {
+                    CoreError::Ffprobe(format!(
+                        "No start timecode and no creation_time in base clip {}",
+                        file_label(params.base_clip)
+                    ))
+                })?;
+                (start - base_start).num_milliseconds() as f64 / 1000.0
+            }
+        };
+
+        let raw_csv_sync_sec = base_csv_sync_sec + delta_sec;
+        let clip_start = raw_csv_sync_sec - params.base_video_sync_sec;
+
+        // Checked before the clamp below, which would otherwise hide a clip
+        // that landed hours away because it belongs to a different dive.
+        if let Some((first, last)) = dive_range {
+            let clip_end = clip_start + info.duration_sec.unwrap_or(0.0);
+            if clip_end < first || clip_start > last {
+                warnings.push(format!(
+                    "{} lands at dive time {}, outside the logged dive ({} to {}). Is it from a different dive?",
+                    file_label(&job.video_path),
+                    format_signed_duration(clip_start),
+                    format_signed_duration(first),
+                    format_signed_duration(last),
+                ));
+            }
+        }
+        if raw_csv_sync_sec < 0.0 {
+            warnings.push(format!(
+                "{} starts before dive time 0:00; its CSV sync was clamped to 0:00.",
+                file_label(&job.video_path)
+            ));
+        }
+
         job.video_sync_sec = params.base_video_sync_sec;
-        job.csv_sync_sec = (base_csv_dt_offset_sec + delta_sec).max(0.0);
+        job.csv_sync_sec = raw_csv_sync_sec.max(0.0);
+        // Recorded whichever clock supplied the delta: `plan_merge` uses it
+        // only to break ties between equal dive times.
+        job.video_start_utc = info.creation_time;
     }
 
-    Ok(())
+    Ok(AutoSyncReport { source, warnings })
 }
 
 #[cfg(test)]
@@ -150,17 +273,40 @@ mod tests {
         dir
     }
 
-    fn synth_clip_with_creation_time(dir: &Path, name: &str, creation_time: &str) -> PathBuf {
+    /// `timecode` writes a `tmcd` track the way a real camera does; passing
+    /// `None` produces a clip with only a `creation_time`, which is what the
+    /// fallback path has to cope with.
+    fn synth_clip(dir: &Path, name: &str, creation_time: &str, timecode: Option<&str>) -> PathBuf {
         let path = dir.join(name);
-        let status = Command::new("ffmpeg")
-            .args(["-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5:duration=1"])
-            .args(["-metadata", &format!("creation_time={creation_time}")])
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=30:duration=2",
+        ])
+        .args(["-metadata", &format!("creation_time={creation_time}")]);
+        if let Some(tc) = timecode {
+            cmd.args(["-timecode", tc]);
+        }
+        let status = cmd
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&path)
             .status()
             .unwrap();
         assert!(status.success());
         path
+    }
+
+    fn job(video: &Path, csv_sync_sec: f64) -> ClipJob {
+        ClipJob {
+            video_path: video.to_path_buf(),
+            output_path: derive_output_path(video, None),
+            video_sync_sec: 0.0,
+            csv_sync_sec,
+            video_start_utc: None,
+        }
     }
 
     #[test]
@@ -192,89 +338,129 @@ mod tests {
     }
 
     #[test]
-    fn auto_sync_offsets_csv_sync_by_creation_time_delta_and_keeps_video_sync_uniform() {
-        let dir = make_dir("auto_sync");
-        let base_clip = synth_clip_with_creation_time(&dir, "base.mp4", "2025-07-05T10:00:00Z");
-        let second_clip = synth_clip_with_creation_time(&dir, "second.mp4", "2025-07-05T10:05:00Z");
+    fn timecode_delta_wraps_across_midnight() {
+        // 23:59:00 -> 00:01:00 is two minutes forward, not 23h58m backward.
+        assert_eq!(timecode_delta(86_340.0, 60.0), 120.0);
+        // ...and the reverse stays negative rather than jumping a day ahead.
+        assert_eq!(timecode_delta(60.0, 86_340.0), -120.0);
+        assert_eq!(timecode_delta(100.0, 400.0), 300.0);
+    }
 
-        let csv_path = dir.join("dive.csv");
-        std::fs::write(
-            &csv_path,
-            "date,time,sample time (min),sample depth (m)\n2025-07-05,09:58:00,0:00,1.0\n2025-07-05,09:59:00,1:00,2.0\n",
-        )
-        .unwrap();
+    #[test]
+    fn auto_sync_offsets_from_the_base_clips_own_csv_sync() {
+        let dir = make_dir("auto_sync_timecode");
+        let base = synth_clip(
+            &dir,
+            "base.mp4",
+            "2025-07-05T10:00:00Z",
+            Some("10:00:00:00"),
+        );
+        let second = synth_clip(
+            &dir,
+            "second.mp4",
+            "2025-07-05T10:05:00Z",
+            Some("10:05:00:00"),
+        );
 
-        let mut jobs = vec![
-            ClipJob {
-                video_path: base_clip.clone(),
-                output_path: PathBuf::from("base_overlay.mp4"),
-                video_sync_sec: 0.0,
-                csv_sync_sec: 0.0,
-                video_start_utc: None,
-            },
-            ClipJob {
-                video_path: second_clip.clone(),
-                output_path: PathBuf::from("second_overlay.mp4"),
-                video_sync_sec: 0.0,
-                csv_sync_sec: 0.0,
-                video_start_utc: None,
-            },
-        ];
-
+        let mut jobs = vec![job(&base, 120.0), job(&second, 0.0)];
         let params = AutoSyncParams {
-            base_clip: &base_clip,
+            base_clip: &base,
             base_video_sync_sec: 2.0,
-            base_csv_datetime: "2025-07-05 10:00:00",
         };
+        // A long dive, so neither clip trips the out-of-range warning.
+        let dive_times: Vec<f64> = (0..3600).map(|s| s as f64).collect();
+        let report = compute_auto_sync(&mut jobs, &dive_times, &params).unwrap();
 
-        compute_auto_sync(&csv_path, &HashMap::new(), &mut jobs, &params).unwrap();
-
-        // CSV's first row is 09:58:00; base sync point is 10:00:00 -> +120s offset.
-        assert!((jobs[0].csv_sync_sec - 120.0).abs() < 1.0);
-        // Second clip started recording 300s after base -> csv_sync_sec should be +300s more.
-        assert!((jobs[1].csv_sync_sec - 420.0).abs() < 1.0);
-        // video_sync_sec must be identical across jobs (copied from base), per original behavior.
+        assert_eq!(report.source, ClipStartSource::Timecode);
+        assert!(
+            report.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            report.warnings
+        );
+        // The base clip keeps the sync point it was given by hand...
+        assert!((jobs[0].csv_sync_sec - 120.0).abs() < 0.1);
+        // ...and the second, recorded 300 s later, is offset by exactly that.
+        assert!((jobs[1].csv_sync_sec - 420.0).abs() < 0.1);
+        // video_sync_sec must be identical across jobs (copied from base).
         assert_eq!(jobs[0].video_sync_sec, 2.0);
         assert_eq!(jobs[1].video_sync_sec, 2.0);
     }
 
     #[test]
-    fn auto_sync_uses_column_map_for_date_and_clock_columns() {
-        let dir = make_dir("auto_sync_column_map");
-        let base_clip = synth_clip_with_creation_time(&dir, "base.mp4", "2025-07-05T10:00:00Z");
+    fn auto_sync_falls_back_to_creation_time_when_a_clip_has_no_timecode() {
+        let dir = make_dir("auto_sync_fallback");
+        // The base has a timecode two hours off its creation_time, mimicking
+        // a camera whose RTC and UTC clock disagree. Mixing the two sources
+        // would place the second clip 2 h away; using creation_time for both
+        // keeps it at +300 s.
+        let base = synth_clip(
+            &dir,
+            "base.mp4",
+            "2025-07-05T10:00:00Z",
+            Some("12:00:00:00"),
+        );
+        let second = synth_clip(&dir, "second.mp4", "2025-07-05T10:05:00Z", None);
 
-        // Header names no heuristic would find.
-        let csv_path = dir.join("dive.csv");
-        std::fs::write(
-            &csv_path,
-            "d,c,sample time (min),sample depth (m)\n2025-07-05,09:58:00,0:00,1.0\n",
-        )
-        .unwrap();
-
-        let make_jobs = || {
-            vec![ClipJob {
-                video_path: base_clip.clone(),
-                output_path: PathBuf::from("base_overlay.mp4"),
-                video_sync_sec: 0.0,
-                csv_sync_sec: 0.0,
-                video_start_utc: None,
-            }]
-        };
+        let mut jobs = vec![job(&base, 120.0), job(&second, 0.0)];
         let params = AutoSyncParams {
-            base_clip: &base_clip,
-            base_video_sync_sec: 2.0,
-            base_csv_datetime: "2025-07-05 10:00:00",
+            base_clip: &base,
+            base_video_sync_sec: 0.0,
         };
+        let report = compute_auto_sync(&mut jobs, &[], &params).unwrap();
 
-        let mut jobs = make_jobs();
-        let err = compute_auto_sync(&csv_path, &HashMap::new(), &mut jobs, &params).unwrap_err();
-        assert!(err.to_string().contains("date and time columns"), "unexpected error: {err}");
+        assert_eq!(report.source, ClipStartSource::CreationTime);
+        assert!((jobs[1].csv_sync_sec - 420.0).abs() < 0.1);
+    }
 
-        let mut map = HashMap::new();
-        map.insert("date".to_string(), "d".to_string());
-        map.insert("clock".to_string(), "c".to_string());
-        let mut jobs = make_jobs();
-        compute_auto_sync(&csv_path, &map, &mut jobs, &params).unwrap();
-        assert!((jobs[0].csv_sync_sec - 120.0).abs() < 1.0);
+    #[test]
+    fn auto_sync_warns_when_a_clip_lands_outside_the_dive() {
+        let dir = make_dir("auto_sync_wrong_dive");
+        let base = synth_clip(
+            &dir,
+            "base.mp4",
+            "2025-07-05T10:00:00Z",
+            Some("10:00:00:00"),
+        );
+        // Four hours later: a different dive that happened to be selected.
+        let other = synth_clip(
+            &dir,
+            "other.mp4",
+            "2025-07-05T14:00:00Z",
+            Some("14:00:00:00"),
+        );
+
+        let mut jobs = vec![job(&base, 0.0), job(&other, 0.0)];
+        let params = AutoSyncParams {
+            base_clip: &base,
+            base_video_sync_sec: 0.0,
+        };
+        let dive_times: Vec<f64> = (0..1800).map(|s| s as f64).collect();
+        let report = compute_auto_sync(&mut jobs, &dive_times, &params).unwrap();
+
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("other.mp4"),
+            "warnings: {:?}",
+            report.warnings
+        );
+        assert!(
+            report.warnings[0].contains("different dive"),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn auto_sync_rejects_a_base_clip_outside_the_job_list() {
+        let mut jobs = vec![job(Path::new("a.mp4"), 0.0)];
+        let params = AutoSyncParams {
+            base_clip: Path::new("not_in_list.mp4"),
+            base_video_sync_sec: 0.0,
+        };
+        let err = compute_auto_sync(&mut jobs, &[], &params).unwrap_err();
+        assert!(
+            err.to_string().contains("must be one of"),
+            "unexpected error: {err}"
+        );
     }
 }
