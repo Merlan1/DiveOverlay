@@ -92,13 +92,10 @@ struct Args {
     auto_sync: bool,
 
     /// Clip path for auto-sync (must be one of the --clip paths). Its own
-    /// csv_sync_mmss is the sync point every other clip is offset from.
+    /// --clip entry carries the sync point every other clip is offset from:
+    /// both its video_sync_sec and its csv_sync_mmss
     #[arg(long, default_value = "")]
     base_clip: String,
-
-    /// Video second of the manual sync point (auto-sync only)
-    #[arg(long, default_value_t = 0.0)]
-    base_video_sync_sec: f64,
 
     /// Process multiple clips. Format: video_path|video_sync_sec|csv_sync_mmss[|output_path].
     /// Can be used multiple times.
@@ -168,10 +165,7 @@ fn main() -> Result<()> {
         }
 
         let base_clip = PathBuf::from(&args.base_clip);
-        let params = AutoSyncParams {
-            base_clip: &base_clip,
-            base_video_sync_sec: args.base_video_sync_sec,
-        };
+        let params = AutoSyncParams { base_clip: &base_clip };
         let report = compute_auto_sync(&mut jobs, &times, &params)?;
         println!("Auto-sync: clips placed by {}.", report.source.label());
         for job in &jobs {

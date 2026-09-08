@@ -116,8 +116,7 @@ fn auto_sync_end_to_end() {
         .args(["--clip", &clip2_spec])
         .arg("--auto-sync")
         .args(["--base-clip"])
-        .arg(&clip1)
-        .args(["--base-video-sync-sec", "0"]);
+        .arg(&clip1);
     let assert = cmd.assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
     assert!(stdout.contains("placed by start timecode"), "stdout: {stdout}");

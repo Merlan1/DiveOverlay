@@ -50,12 +50,11 @@ struct ClipEntry {
 /// Auto-sync settings: only the base clip is synced by hand, and every
 /// other clip's CSV sync point is derived from how much later it started
 /// recording (see `dive_overlay_core::sync::compute_auto_sync`). The base
-/// clip's own CSV sync comes from its row in the clip table, so there is
-/// nothing to carry here beyond which clip it is.
+/// clip's own sync point -- both halves of it -- comes from its row in the
+/// clip table, so the only choice made here is which clip is the base.
 #[derive(Clone)]
 struct AutoSyncConfig {
     base_clip: PathBuf,
-    base_video_sync_sec: f64,
 }
 
 /// Everything the background worker needs for one run, bundled up so a new
@@ -186,7 +185,6 @@ struct App {
     merge_output: String,
     auto_sync: bool,
     base_clip_index: usize,
-    base_video_sync: String,
     entries: Vec<ClipEntry>,
     selected: Option<usize>,
     status: String,
@@ -221,7 +219,6 @@ impl Default for App {
             merge_output: String::new(),
             auto_sync: false,
             base_clip_index: 0,
-            base_video_sync: "0.0".to_string(),
             entries: Vec::new(),
             selected: None,
             status: "Ready".to_string(),
@@ -493,19 +490,22 @@ impl App {
                             ui.selectable_value(&mut base_clip_index, i, name);
                         }
                     });
+                // Both halves of the base clip's sync point are read-only
+                // here: they are the base clip's own fields, edited in the
+                // clip table or scrubbed in the sync preview like any other
+                // clip's, and shown here only to make clear which values the
+                // rest are derived from. A second editable copy of the video
+                // sync used to live here, which meant scrubbing the preview
+                // and leaving this box at its default silently anchored every
+                // clip to the wrong frame.
+                let base = self.entries.get(base_clip_index);
                 ui.label("Video sync (s):");
-                ui.add(egui::TextEdit::singleline(&mut self.base_video_sync).desired_width(60.0));
+                ui.strong(
+                    base.map(|e| format!("{:.2}", e.video_sync_sec))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
                 ui.label("CSV sync:");
-                // Read-only: the anchor is the base clip's own CSV sync, so
-                // it is edited in the clip table (or the sync preview) like
-                // any other clip's, and only shown here to make clear which
-                // value the rest are derived from.
-                let base_csv_sync = self
-                    .entries
-                    .get(base_clip_index)
-                    .map(|e| e.csv_sync_mmss.clone())
-                    .unwrap_or_else(|| "-".to_string());
-                ui.strong(base_csv_sync);
+                ui.strong(base.map(|e| e.csv_sync_mmss.clone()).unwrap_or_else(|| "-".to_string()));
                 ui.weak("(from the clip table)");
             });
 
@@ -1100,14 +1100,8 @@ impl App {
                     .push("Error: please select a base clip for auto-sync.".to_string());
                 return;
             };
-            let Ok(base_video_sync_sec) = self.base_video_sync.trim().parse::<f64>() else {
-                self.log_lines
-                    .push("Error: the base clip's video sync must be a number.".to_string());
-                return;
-            };
             Some(AutoSyncConfig {
                 base_clip: entry.video_path.clone(),
-                base_video_sync_sec,
             })
         } else {
             None
@@ -1187,7 +1181,6 @@ fn run_worker(
     if let Some(auto) = &auto_sync {
         let params = AutoSyncParams {
             base_clip: &auto.base_clip,
-            base_video_sync_sec: auto.base_video_sync_sec,
         };
         let report = compute_auto_sync(&mut jobs, &times, &params).map_err(|e| e.to_string())?;
         let _ = tx.send(WorkerEvent::Log(format!(

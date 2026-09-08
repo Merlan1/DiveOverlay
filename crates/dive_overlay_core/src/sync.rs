@@ -96,7 +96,6 @@ impl ClipStartSource {
 
 pub struct AutoSyncParams<'a> {
     pub base_clip: &'a Path,
-    pub base_video_sync_sec: f64,
 }
 
 /// Outcome of `compute_auto_sync`: which clock supplied the deltas, plus any
@@ -158,8 +157,8 @@ fn format_signed_duration(seconds: f64) -> String {
 /// sync.
 ///
 /// Preserves the original's exact (slightly surprising) behavior: every job
-/// receives the *same* `video_sync_sec`, copied verbatim from
-/// `base_video_sync_sec` -- only `csv_sync_sec` varies per clip. This is
+/// receives the *same* `video_sync_sec`, copied verbatim from the base
+/// clip's own -- only `csv_sync_sec` varies per clip. This is
 /// intentional, not a bug to fix: it assumes every clip's manual sync point
 /// sits at the same video second (e.g. "point the camera at the dive
 /// computer for the first few seconds of every clip").
@@ -196,9 +195,13 @@ pub fn compute_auto_sync(
 
     let base_timecode = infos[base_index].timecode_sec;
     let base_creation = infos[base_index].creation_time;
-    // The base clip's hand-entered CSV sync is the anchor every other clip
-    // is offset from.
+    // The base clip's hand-entered sync point is the anchor every other clip
+    // is offset from: the CSV time the diver read, and the video second they
+    // read it at. Both halves live on the base clip's own job, so neither is
+    // passed in alongside it -- a second copy could disagree with the one the
+    // caller shows the user.
     let base_csv_sync_sec = jobs[base_index].csv_sync_sec;
+    let base_video_sync_sec = jobs[base_index].video_sync_sec;
 
     let mut warnings = Vec::new();
     let dive_range = dive_times.first().copied().zip(dive_times.last().copied());
@@ -226,7 +229,7 @@ pub fn compute_auto_sync(
         };
 
         let raw_csv_sync_sec = base_csv_sync_sec + delta_sec;
-        let clip_start = raw_csv_sync_sec - params.base_video_sync_sec;
+        let clip_start = raw_csv_sync_sec - base_video_sync_sec;
 
         // Checked before the clamp below, which would otherwise hide a clip
         // that landed hours away because it belongs to a different dive.
@@ -249,7 +252,7 @@ pub fn compute_auto_sync(
             ));
         }
 
-        job.video_sync_sec = params.base_video_sync_sec;
+        job.video_sync_sec = base_video_sync_sec;
         job.csv_sync_sec = raw_csv_sync_sec.max(0.0);
         // Recorded whichever clock supplied the delta: `plan_merge` uses it
         // only to break ties between equal dive times.
@@ -345,10 +348,11 @@ mod tests {
         let second = synth_clip(&dir, "second.mp4", "2025-07-05T10:05:00Z", Some("10:05:00:00"));
 
         let mut jobs = vec![job(&base, 120.0), job(&second, 0.0)];
-        let params = AutoSyncParams {
-            base_clip: &base,
-            base_video_sync_sec: 2.0,
-        };
+        // The base clip carries the video second the sync point was read at;
+        // the other clip's own value is meaningless and must be overwritten.
+        jobs[0].video_sync_sec = 2.0;
+        jobs[1].video_sync_sec = 9.0;
+        let params = AutoSyncParams { base_clip: &base };
         // A long dive, so neither clip trips the out-of-range warning.
         let dive_times: Vec<f64> = (0..3600).map(|s| s as f64).collect();
         let report = compute_auto_sync(&mut jobs, &dive_times, &params).unwrap();
@@ -359,7 +363,8 @@ mod tests {
         assert!((jobs[0].csv_sync_sec - 120.0).abs() < 0.1);
         // ...and the second, recorded 300 s later, is offset by exactly that.
         assert!((jobs[1].csv_sync_sec - 420.0).abs() < 0.1);
-        // video_sync_sec must be identical across jobs (copied from base).
+        // video_sync_sec must be identical across jobs, taken from the base
+        // clip's own field rather than from anything passed in beside it.
         assert_eq!(jobs[0].video_sync_sec, 2.0);
         assert_eq!(jobs[1].video_sync_sec, 2.0);
     }
@@ -375,10 +380,7 @@ mod tests {
         let second = synth_clip(&dir, "second.mp4", "2025-07-05T10:05:00Z", None);
 
         let mut jobs = vec![job(&base, 120.0), job(&second, 0.0)];
-        let params = AutoSyncParams {
-            base_clip: &base,
-            base_video_sync_sec: 0.0,
-        };
+        let params = AutoSyncParams { base_clip: &base };
         let report = compute_auto_sync(&mut jobs, &[], &params).unwrap();
 
         assert_eq!(report.source, ClipStartSource::CreationTime);
@@ -393,10 +395,7 @@ mod tests {
         let other = synth_clip(&dir, "other.mp4", "2025-07-05T14:00:00Z", Some("14:00:00:00"));
 
         let mut jobs = vec![job(&base, 0.0), job(&other, 0.0)];
-        let params = AutoSyncParams {
-            base_clip: &base,
-            base_video_sync_sec: 0.0,
-        };
+        let params = AutoSyncParams { base_clip: &base };
         let dive_times: Vec<f64> = (0..1800).map(|s| s as f64).collect();
         let report = compute_auto_sync(&mut jobs, &dive_times, &params).unwrap();
 
@@ -418,7 +417,6 @@ mod tests {
         let mut jobs = vec![job(Path::new("a.mp4"), 0.0)];
         let params = AutoSyncParams {
             base_clip: Path::new("not_in_list.mp4"),
-            base_video_sync_sec: 0.0,
         };
         let err = compute_auto_sync(&mut jobs, &[], &params).unwrap_err();
         assert!(err.to_string().contains("must be one of"), "unexpected error: {err}");
