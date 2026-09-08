@@ -8,7 +8,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
 use dive_overlay_core::csv_data::{
-    format_duration, format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds, parse_fields,
+    format_duration, format_signed_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds,
+    parse_fields,
 };
 use dive_overlay_core::ffprobe::ensure_ffmpeg_available;
 use dive_overlay_core::merge::{finish_merge, plan_merge};
@@ -129,8 +130,9 @@ fn build_jobs(args: &Args) -> Result<Vec<ClipJob>> {
     Ok(vec![ClipJob {
         video_path: video,
         output_path: output,
-        video_sync_sec: args.video_sync_sec,
-        csv_sync_sec,
+        // The pair the diver observed collapses here into the one number
+        // the job needs: the dive time at the clip's first frame.
+        dive_start_sec: csv_sync_sec - args.video_sync_sec,
         video_start_utc: None,
     }])
 }
@@ -170,9 +172,9 @@ fn main() -> Result<()> {
         println!("Auto-sync: clips placed by {}.", report.source.label());
         for job in &jobs {
             println!(
-                "  {} -> CSV {}",
+                "  {} -> starts at dive time {}",
                 job.video_path.file_name().unwrap_or_default().to_string_lossy(),
-                format_duration_precise(job.csv_sync_sec),
+                format_signed_duration_precise(job.dive_start_sec),
             );
         }
         for warning in &report.warnings {

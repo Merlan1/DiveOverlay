@@ -40,8 +40,9 @@ pub fn parse_clip_spec(spec: &str) -> Result<ClipJob, CoreError> {
     Ok(ClipJob {
         video_path,
         output_path,
-        video_sync_sec,
-        csv_sync_sec,
+        // The user gives the two numbers they can observe; the job carries
+        // only what they mean together.
+        dive_start_sec: csv_sync_sec - video_sync_sec,
         video_start_utc: None,
     })
 }
@@ -196,12 +197,10 @@ pub fn compute_auto_sync(
     let base_timecode = infos[base_index].timecode_sec;
     let base_creation = infos[base_index].creation_time;
     // The base clip's hand-entered sync point is the anchor every other clip
-    // is offset from: the CSV time the diver read, and the video second they
-    // read it at. Both halves live on the base clip's own job, so neither is
-    // passed in alongside it -- a second copy could disagree with the one the
-    // caller shows the user.
-    let base_csv_sync_sec = jobs[base_index].csv_sync_sec;
-    let base_video_sync_sec = jobs[base_index].video_sync_sec;
+    // is offset from. It lives on the base clip's own job, already resolved
+    // to the dive time at its first frame, so nothing is passed in alongside
+    // `base_clip` that could disagree with what the caller shows the user.
+    let base_dive_start_sec = jobs[base_index].dive_start_sec;
 
     let mut warnings = Vec::new();
     let dive_range = dive_times.first().copied().zip(dive_times.last().copied());
@@ -228,11 +227,10 @@ pub fn compute_auto_sync(
             }
         };
 
-        let raw_csv_sync_sec = base_csv_sync_sec + delta_sec;
-        let clip_start = raw_csv_sync_sec - base_video_sync_sec;
+        // A clip that started `delta_sec` later than the base began that much
+        // further into the dive.
+        let clip_start = base_dive_start_sec + delta_sec;
 
-        // Checked before the clamp below, which would otherwise hide a clip
-        // that landed hours away because it belongs to a different dive.
         if let Some((first, last)) = dive_range {
             let clip_end = clip_start + info.duration_sec.unwrap_or(0.0);
             if clip_end < first || clip_start > last {
@@ -245,15 +243,20 @@ pub fn compute_auto_sync(
                 ));
             }
         }
-        if raw_csv_sync_sec < 0.0 {
+        // Left where it lands, negative and all: a clip that really was
+        // recorded before the diver descended shows no telemetry until the
+        // dive reaches it, which is what the manual path has always done for
+        // the same footage. Nudging it to 0:00 instead would silently move
+        // the clip and label pre-dive footage as dive time zero.
+        if clip_start < 0.0 {
             warnings.push(format!(
-                "{} starts before dive time 0:00; its CSV sync was clamped to 0:00.",
-                file_label(&job.video_path)
+                "{} starts {} before dive time 0:00; its first frames will show no telemetry.",
+                file_label(&job.video_path),
+                format_signed_duration(-clip_start),
             ));
         }
 
-        job.video_sync_sec = base_video_sync_sec;
-        job.csv_sync_sec = raw_csv_sync_sec.max(0.0);
+        job.dive_start_sec = clip_start;
         // Recorded whichever clock supplied the delta: `plan_merge` uses it
         // only to break ties between equal dive times.
         job.video_start_utc = info.creation_time;
@@ -294,12 +297,11 @@ mod tests {
         path
     }
 
-    fn job(video: &Path, csv_sync_sec: f64) -> ClipJob {
+    fn job(video: &Path, dive_start_sec: f64) -> ClipJob {
         ClipJob {
             video_path: video.to_path_buf(),
             output_path: derive_output_path(video, None),
-            video_sync_sec: 0.0,
-            csv_sync_sec,
+            dive_start_sec,
             video_start_utc: None,
         }
     }
@@ -307,8 +309,8 @@ mod tests {
     #[test]
     fn parse_clip_spec_three_and_four_parts() {
         let job = parse_clip_spec("video.mp4|1.5|0:10").unwrap();
-        assert_eq!(job.video_sync_sec, 1.5);
-        assert_eq!(job.csv_sync_sec, 10.0);
+        // Video second 1.5 shows dive time 0:10, so the clip opened at 8.5 s.
+        assert_eq!(job.dive_start_sec, 8.5);
         assert_eq!(job.output_path, PathBuf::from("video_overlay.mp4"));
 
         let job2 = parse_clip_spec("video.mp4|1.5|0:10|out.mp4").unwrap();
@@ -342,16 +344,15 @@ mod tests {
     }
 
     #[test]
-    fn auto_sync_offsets_from_the_base_clips_own_csv_sync() {
+    fn auto_sync_offsets_from_the_base_clips_own_sync_point() {
         let dir = make_dir("auto_sync_timecode");
         let base = synth_clip(&dir, "base.mp4", "2025-07-05T10:00:00Z", Some("10:00:00:00"));
         let second = synth_clip(&dir, "second.mp4", "2025-07-05T10:05:00Z", Some("10:05:00:00"));
 
-        let mut jobs = vec![job(&base, 120.0), job(&second, 0.0)];
-        // The base clip carries the video second the sync point was read at;
-        // the other clip's own value is meaningless and must be overwritten.
-        jobs[0].video_sync_sec = 2.0;
-        jobs[1].video_sync_sec = 9.0;
+        // The base clip opens at dive second 118 (its diver read 2:00 on the
+        // computer 2 s into the video); the other clip's own value is
+        // meaningless here and must be overwritten.
+        let mut jobs = vec![job(&base, 118.0), job(&second, -9.0)];
         let params = AutoSyncParams { base_clip: &base };
         // A long dive, so neither clip trips the out-of-range warning.
         let dive_times: Vec<f64> = (0..3600).map(|s| s as f64).collect();
@@ -360,13 +361,9 @@ mod tests {
         assert_eq!(report.source, ClipStartSource::Timecode);
         assert!(report.warnings.is_empty(), "unexpected warnings: {:?}", report.warnings);
         // The base clip keeps the sync point it was given by hand...
-        assert!((jobs[0].csv_sync_sec - 120.0).abs() < 0.1);
+        assert!((jobs[0].dive_start_sec - 118.0).abs() < 0.1);
         // ...and the second, recorded 300 s later, is offset by exactly that.
-        assert!((jobs[1].csv_sync_sec - 420.0).abs() < 0.1);
-        // video_sync_sec must be identical across jobs, taken from the base
-        // clip's own field rather than from anything passed in beside it.
-        assert_eq!(jobs[0].video_sync_sec, 2.0);
-        assert_eq!(jobs[1].video_sync_sec, 2.0);
+        assert!((jobs[1].dive_start_sec - 418.0).abs() < 0.1);
     }
 
     #[test]
@@ -384,9 +381,34 @@ mod tests {
         let report = compute_auto_sync(&mut jobs, &[], &params).unwrap();
 
         assert_eq!(report.source, ClipStartSource::CreationTime);
-        assert!((jobs[1].csv_sync_sec - 420.0).abs() < 0.1);
+        assert!((jobs[1].dive_start_sec - 420.0).abs() < 0.1);
     }
 
+    /// A clip recorded before the diver descended keeps its negative dive
+    /// start. Nudging it to 0:00 -- which the old code did to the CSV half of
+    /// the sync pair -- would move the clip and label pre-dive footage as
+    /// dive time zero; leaving it alone lets the overlay show no telemetry
+    /// until the dive catches up, exactly as the manual path always has.
+    #[test]
+    fn auto_sync_leaves_a_clip_recorded_before_the_dive_where_it_lands() {
+        let dir = make_dir("auto_sync_before_dive");
+        let base = synth_clip(&dir, "base.mp4", "2025-07-05T10:05:00Z", Some("10:05:00:00"));
+        let early = synth_clip(&dir, "early.mp4", "2025-07-05T10:00:00Z", Some("10:00:00:00"));
+
+        // The base opens at dive second 60; the other clip started 300 s
+        // earlier, so it opens 240 s before the dive did.
+        let mut jobs = vec![job(&base, 60.0), job(&early, 0.0)];
+        let params = AutoSyncParams { base_clip: &base };
+        let dive_times: Vec<f64> = (0..3600).map(|s| s as f64).collect();
+        let report = compute_auto_sync(&mut jobs, &dive_times, &params).unwrap();
+
+        assert!((jobs[1].dive_start_sec - -240.0).abs() < 0.1);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("before dive time 0:00")),
+            "expected a pre-dive warning: {:?}",
+            report.warnings
+        );
+    }
     #[test]
     fn auto_sync_warns_when_a_clip_lands_outside_the_dive() {
         let dir = make_dir("auto_sync_wrong_dive");

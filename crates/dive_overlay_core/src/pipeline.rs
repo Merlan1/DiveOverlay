@@ -823,7 +823,7 @@ pub fn process_clip(
             .ok_or_else(|| CoreError::Ffmpeg("Invalid frame size".to_string()))?;
 
         let video_sec = frame_idx as f64 / info.fps;
-        let dive_sec = job.csv_sync_sec + (video_sec - job.video_sync_sec);
+        let dive_sec = job.dive_start_sec + video_sec;
 
         let lines = build_overlay_lines(&options.fields, samples, times, dive_sec, options.interpolate);
         draw_overlay_yuv(&mut img, &lines, &mut overlay_cache, range);
@@ -915,8 +915,7 @@ pub fn process_clip_subtitles(
         &options.fields,
         samples,
         times,
-        job.video_sync_sec,
-        job.csv_sync_sec,
+        job.dive_start_sec,
         video_duration_sec,
         options.interpolate,
     );
@@ -1071,8 +1070,7 @@ mod tests {
         let job = ClipJob {
             video_path: clip.clone(),
             output_path: clip.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let options = ProcessingOptions {
@@ -1111,8 +1109,7 @@ mod tests {
         let job = ClipJob {
             video_path: clip,
             output_path: output_dir,
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let options = ProcessingOptions {
@@ -1163,8 +1160,7 @@ mod tests {
         let job = ClipJob {
             video_path: rotated,
             output_path: output.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let samples = vec![sample(0.0, 1.0)];
@@ -1220,8 +1216,7 @@ mod tests {
         let job = ClipJob {
             video_path: vfr,
             output_path: output.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let samples = vec![sample(0.0, 1.0)];
@@ -1341,8 +1336,7 @@ mod tests {
         let job = ClipJob {
             video_path: clip,
             output_path: output.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let options = ProcessingOptions {
@@ -1380,8 +1374,7 @@ mod tests {
         let job = ClipJob {
             video_path: clip,
             output_path: output.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let options = ProcessingOptions {
@@ -1567,8 +1560,7 @@ mod tests {
         let job = ClipJob {
             video_path: clip,
             output_path: output.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let samples = vec![sample(0.0, 1.0), sample(1.0, 5.0)];
@@ -1641,8 +1633,7 @@ mod tests {
         let job = ClipJob {
             video_path: clip,
             output_path: output.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let samples = vec![sample(0.0, 1.0), sample(1.0, 5.0), sample(2.0, 3.0)];
@@ -1715,8 +1706,7 @@ mod tests {
         let job = ClipJob {
             video_path: clip,
             output_path: output.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let samples = vec![sample(0.0, 1.0)];
@@ -1762,8 +1752,7 @@ mod tests {
         let job = ClipJob {
             video_path: clip,
             output_path: output.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let samples = vec![sample(0.0, 1.0), sample(1.0, 5.0)];
@@ -1813,8 +1802,7 @@ mod tests {
         let job = ClipJob {
             video_path: clip,
             output_path: output.clone(),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         };
         let samples = vec![sample(0.0, 1.0), sample(1.0, 5.0), sample(2.0, 3.0)];

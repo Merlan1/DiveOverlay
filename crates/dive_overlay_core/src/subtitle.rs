@@ -20,8 +20,7 @@ pub fn build_srt(
     fields: &[Field],
     samples: &[DiveSample],
     times: &[f64],
-    video_sync_sec: f64,
-    csv_sync_sec: f64,
+    dive_start_sec: f64,
     video_duration_sec: f64,
     interpolate: bool,
 ) -> String {
@@ -35,7 +34,7 @@ pub fn build_srt(
             break;
         }
 
-        let dive_sec = csv_sync_sec + (start - video_sync_sec);
+        let dive_sec = dive_start_sec + start;
         let lines = build_overlay_lines(fields, samples, times, dive_sec, interpolate);
 
         out.push_str(&(sec + 1).to_string());
@@ -155,7 +154,7 @@ mod tests {
         let samples = vec![sample(0.0, 1.0), sample(1.0, 2.0), sample(2.0, 3.0)];
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
 
-        let srt = build_srt(&[Field::Time, Field::Depth], &samples, &times, 0.0, 0.0, 2.5, false);
+        let srt = build_srt(&[Field::Time, Field::Depth], &samples, &times, 0.0, 2.5, false);
 
         assert_eq!(srt.matches(" --> ").count(), 3);
         assert!(srt.starts_with("1\n00:00:00,000 --> 00:00:01,000\n"));
@@ -168,9 +167,9 @@ mod tests {
         let samples = vec![sample(10.0, 5.0)];
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
 
-        // video-second 0 corresponds to csv_sync_sec=10, so the single cue
-        // should already show the sample instead of "No data".
-        let srt = build_srt(&[Field::Depth], &samples, &times, 0.0, 10.0, 1.0, false);
+        // The clip opens at dive second 10, so its single cue should already
+        // show the sample instead of "No data".
+        let srt = build_srt(&[Field::Depth], &samples, &times, 10.0, 1.0, false);
         assert!(srt.contains("Depth: 5.0 m"));
         assert!(!srt.contains("No data"));
     }
@@ -188,7 +187,7 @@ mod tests {
     fn round_trips_every_timestamp_a_built_track_contains() {
         let samples = vec![sample(0.0, 1.0), sample(1.0, 2.0)];
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
-        let srt = build_srt(&[Field::Depth], &samples, &times, 0.0, 0.0, 2.0, false);
+        let srt = build_srt(&[Field::Depth], &samples, &times, 0.0, 2.0, false);
 
         for line in srt.lines().filter(|l| l.contains(" --> ")) {
             let (start, end) = line.split_once(" --> ").unwrap();

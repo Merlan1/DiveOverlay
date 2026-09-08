@@ -11,12 +11,20 @@ pub struct DiveSample {
     pub heart_rate: Option<f64>,
 }
 
+/// One clip to process.
+///
+/// The sync point reaches this struct already resolved: `dive_start_sec` is
+/// the dive-elapsed time at the clip's video second zero, so a frame at
+/// video second `s` shows dive time `dive_start_sec + s`. The frontends take
+/// the pair a diver can actually observe -- a video second they scrubbed to,
+/// and the dive time they read off the computer in that frame -- and subtract
+/// one from the other at the boundary. Storing the pair here instead invites
+/// code to clamp or adjust one half alone, which moves the clip.
 #[derive(Debug, Clone)]
 pub struct ClipJob {
     pub video_path: PathBuf,
     pub output_path: PathBuf,
-    pub video_sync_sec: f64,
-    pub csv_sync_sec: f64,
+    pub dive_start_sec: f64,
     pub video_start_utc: Option<DateTime<Utc>>,
 }
 

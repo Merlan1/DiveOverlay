@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use dive_overlay_core::csv_data::{
-    format_duration, format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds, parse_fields,
+    format_duration, format_signed_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds,
+    parse_fields,
 };
 use dive_overlay_core::ffprobe::probe_video;
 use dive_overlay_core::merge::{finish_merge, plan_merge, MergePlan};
@@ -1171,8 +1172,8 @@ fn run_worker(
             Ok(ClipJob {
                 video_path: entry.video_path.clone(),
                 output_path: entry.output_path.with_extension("mp4"),
-                video_sync_sec: entry.video_sync_sec,
-                csv_sync_sec: parse_duration_to_seconds(&entry.csv_sync_mmss).map_err(|e| e.to_string())?,
+                dive_start_sec: parse_duration_to_seconds(&entry.csv_sync_mmss).map_err(|e| e.to_string())?
+                    - entry.video_sync_sec,
                 video_start_utc: None,
             })
         })
@@ -1189,12 +1190,12 @@ fn run_worker(
         )));
         for job in &jobs {
             let _ = tx.send(WorkerEvent::Log(format!(
-                "Auto-sync: {} -> CSV {}",
+                "Auto-sync: {} -> starts at dive time {}",
                 job.video_path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default(),
-                format_duration_precise(job.csv_sync_sec),
+                format_signed_duration_precise(job.dive_start_sec),
             )));
         }
         for warning in &report.warnings {

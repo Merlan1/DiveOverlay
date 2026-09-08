@@ -32,15 +32,6 @@ use crate::pipeline::{
 };
 use crate::subtitle::{concat_srt, SrtPart};
 
-/// The dive-elapsed second a clip's very first frame shows, i.e. the key
-/// that puts clips in dive order. It works for both sync modes: manual
-/// entries carry the sync pair directly, and auto-sync derives each clip's
-/// `csv_sync_sec` from its recording timestamp, so the same subtraction
-/// sorts those too.
-pub fn dive_start_sec(job: &ClipJob) -> f64 {
-    job.csv_sync_sec - job.video_sync_sec
-}
-
 /// Sorts clips into the order they happened during the dive. Frontends
 /// accept clips in whatever order the user listed them, which is not
 /// necessarily chronological -- concatenating in list order would splice
@@ -50,8 +41,8 @@ pub fn dive_start_sec(job: &ClipJob) -> f64 {
 /// `None` for manually synced clips.
 pub fn sort_jobs_chronologically(jobs: &mut [ClipJob]) {
     jobs.sort_by(|a, b| {
-        dive_start_sec(a)
-            .partial_cmp(&dive_start_sec(b))
+        a.dive_start_sec
+            .partial_cmp(&b.dive_start_sec)
             .unwrap_or(Ordering::Equal)
             .then_with(|| a.video_start_utc.cmp(&b.video_start_utc))
     });
@@ -505,12 +496,11 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
 
-    fn job(video: &str, video_sync_sec: f64, csv_sync_sec: f64) -> ClipJob {
+    fn job(video: &str, dive_start_sec: f64) -> ClipJob {
         ClipJob {
             video_path: PathBuf::from(video),
             output_path: PathBuf::from("out.mp4"),
-            video_sync_sec,
-            csv_sync_sec,
+            dive_start_sec,
             video_start_utc: None,
         }
     }
@@ -600,17 +590,11 @@ mod tests {
     }
 
     #[test]
-    fn dive_start_sec_is_the_dive_time_at_video_second_zero() {
-        assert_eq!(dive_start_sec(&job("a.mp4", 3.0, 120.0)), 117.0);
-        assert_eq!(dive_start_sec(&job("a.mp4", 0.0, 0.0)), 0.0);
-    }
-
-    #[test]
     fn sorts_clips_into_dive_order_not_list_order() {
         let mut jobs = vec![
-            job("third.mp4", 2.0, 600.0),
-            job("first.mp4", 2.0, 60.0),
-            job("second.mp4", 5.0, 300.0),
+            job("third.mp4", 598.0),
+            job("first.mp4", 58.0),
+            job("second.mp4", 295.0),
         ];
         sort_jobs_chronologically(&mut jobs);
         let order: Vec<_> = jobs.iter().map(|j| j.video_path.display().to_string()).collect();
@@ -619,9 +603,9 @@ mod tests {
 
     #[test]
     fn equal_dive_starts_fall_back_to_the_recording_timestamp() {
-        let mut later = job("later.mp4", 0.0, 100.0);
+        let mut later = job("later.mp4", 100.0);
         later.video_start_utc = Some(Utc.with_ymd_and_hms(2025, 7, 5, 10, 5, 0).unwrap());
-        let mut earlier = job("earlier.mp4", 0.0, 100.0);
+        let mut earlier = job("earlier.mp4", 100.0);
         earlier.video_start_utc = Some(Utc.with_ymd_and_hms(2025, 7, 5, 10, 0, 0).unwrap());
 
         let mut jobs = vec![later, earlier];
@@ -633,7 +617,7 @@ mod tests {
     fn plan_merge_orders_jobs_and_redirects_them_to_numbered_parts() {
         let dir = make_dir("plan");
         let merge_output = dir.join("dive_full.mp4");
-        let mut jobs = vec![job("b.mp4", 0.0, 200.0), job("a.mp4", 0.0, 100.0)];
+        let mut jobs = vec![job("b.mp4", 200.0), job("a.mp4", 100.0)];
 
         let plan = plan_merge(&mut jobs, &merge_output).unwrap();
 
@@ -653,8 +637,7 @@ mod tests {
         let mut jobs = vec![ClipJob {
             video_path: clip.clone(),
             output_path: dir.join("out.mp4"),
-            video_sync_sec: 0.0,
-            csv_sync_sec: 0.0,
+            dive_start_sec: 0.0,
             video_start_utc: None,
         }];
         assert!(plan_merge(&mut jobs, &clip).is_err());

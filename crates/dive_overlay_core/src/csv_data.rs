@@ -89,6 +89,17 @@ pub fn format_duration_precise(seconds: f64) -> String {
     }
 }
 
+/// `format_duration_precise` with a leading `-` for negative values, which
+/// `format_duration_precise` itself clamps away.
+///
+/// Used to report where auto-sync placed a clip: a clip recorded before the
+/// diver descended has a negative dive start, and reporting it as `00:00`
+/// would hide exactly the case the accompanying warning is about.
+pub fn format_signed_duration_precise(seconds: f64) -> String {
+    let sign = if seconds < 0.0 { "-" } else { "" };
+    format!("{sign}{}", format_duration_precise(seconds.abs()))
+}
+
 pub fn parse_optional_float(value: Option<&str>) -> Option<f64> {
     let text = value?.trim().trim_matches('"');
     if text.is_empty() {

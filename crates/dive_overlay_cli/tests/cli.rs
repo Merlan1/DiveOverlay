@@ -120,8 +120,11 @@ fn auto_sync_end_to_end() {
     let assert = cmd.assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
     assert!(stdout.contains("placed by start timecode"), "stdout: {stdout}");
-    // Second clip started 5 minutes after the base, whose own sync is 0:00.
-    assert!(stdout.contains("c2.mp4 -> CSV 05:00"), "stdout: {stdout}");
+    // Second clip started 5 minutes after the base, which opens at 0:00.
+    assert!(
+        stdout.contains("c2.mp4 -> starts at dive time 05:00"),
+        "stdout: {stdout}"
+    );
 
     assert!(clip1.with_file_name("c1_overlay.mp4").exists());
     assert!(clip2.with_file_name("c2_overlay.mp4").exists());
