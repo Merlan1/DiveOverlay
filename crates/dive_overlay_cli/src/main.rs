@@ -7,7 +7,10 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
-use dive_overlay_core::csv_data::{load_samples, parse_column_map, parse_duration_to_seconds, parse_fields};
+use dive_overlay_core::csv_data::{
+    format_duration, format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds,
+    parse_fields,
+};
 use dive_overlay_core::ffprobe::ensure_ffmpeg_available;
 use dive_overlay_core::merge::{finish_merge, plan_merge};
 use dive_overlay_core::pipeline::{process_clip, Codec, OutputMode, Preset, ProcessingOptions};
@@ -76,21 +79,20 @@ struct Args {
     #[arg(long, default_value = "overlay")]
     mode: String,
 
-    /// Automatic sync based on MP4 CreationTime + CSV date/time
+    /// Derives every clip's CSV sync from one manually-synced base clip and
+    /// how much later each clip started recording (from its start timecode,
+    /// falling back to the MP4 creation time)
     #[arg(long)]
     auto_sync: bool,
 
-    /// Clip path for auto-sync (must be one of the --clip paths)
+    /// Clip path for auto-sync (must be one of the --clip paths). Its own
+    /// csv_sync_mmss is the sync point every other clip is offset from.
     #[arg(long, default_value = "")]
     base_clip: String,
 
     /// Video second of the manual sync point (auto-sync only)
     #[arg(long, default_value_t = 0.0)]
     base_video_sync_sec: f64,
-
-    /// CSV date/time at the sync point (ISO: YYYY-MM-DD HH:MM:SS)
-    #[arg(long, default_value = "")]
-    base_csv_datetime: String,
 
     /// Process multiple clips. Format: video_path|video_sync_sec|csv_sync_mmss[|output_path].
     /// Can be used multiple times.
@@ -154,17 +156,24 @@ fn main() -> Result<()> {
         if args.base_clip.is_empty() {
             bail!("Auto-sync requires --base-clip");
         }
-        if args.base_csv_datetime.is_empty() {
-            bail!("Auto-sync requires --base-csv-datetime");
-        }
 
         let base_clip = PathBuf::from(&args.base_clip);
         let params = AutoSyncParams {
             base_clip: &base_clip,
             base_video_sync_sec: args.base_video_sync_sec,
-            base_csv_datetime: &args.base_csv_datetime,
         };
-        compute_auto_sync(&args.csv, &column_map, &mut jobs, &params)?;
+        let report = compute_auto_sync(&mut jobs, &times, &params)?;
+        println!("Auto-sync: clips placed by {}.", report.source.label());
+        for job in &jobs {
+            println!(
+                "  {} -> CSV {}",
+                job.video_path.file_name().unwrap_or_default().to_string_lossy(),
+                format_duration_precise(job.csv_sync_sec),
+            );
+        }
+        for warning in &report.warnings {
+            eprintln!("Warning: {warning}");
+        }
     }
 
     let mode = OutputMode::parse(&args.mode)
@@ -262,8 +271,29 @@ fn main() -> Result<()> {
 
     if let (Some(plan), Some(merge_output)) = (&plan, &merge_output) {
         println!("Combining {total} clip(s) into {}...", merge_output.display());
-        finish_merge(plan, merge_output, mode, &options, &stop_flag)
-            .with_context(|| format!("Combining clips failed (parts kept in {})", plan.parts_dir.display()))?;
+        let mut last_print = Instant::now();
+        let mut printed_progress = false;
+        finish_merge(plan, merge_output, mode, &options, &stop_flag, |done_sec, total_sec| {
+            // Throttled like the per-clip counter above: the merge polls ffmpeg
+            // ten times a second, which is far more often than a terminal line
+            // needs rewriting.
+            if total_sec <= 0.0 || (last_print.elapsed().as_secs_f64() < 0.2 && done_sec < total_sec) {
+                return;
+            }
+            let percent = (done_sec * 100.0 / total_sec).min(100.0);
+            print!(
+                "\rCombining {} / {} ({percent:.0}%)   ",
+                format_duration(done_sec.min(total_sec)),
+                format_duration(total_sec)
+            );
+            let _ = std::io::stdout().flush();
+            printed_progress = true;
+            last_print = Instant::now();
+        })
+        .with_context(|| format!("Combining clips failed (parts kept in {})", plan.parts_dir.display()))?;
+        if printed_progress {
+            println!();
+        }
         println!("Done: {}", merge_output.display());
     }
 

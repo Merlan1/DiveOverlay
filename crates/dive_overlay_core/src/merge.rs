@@ -15,9 +15,11 @@
 //! an honest rendering of footage that genuinely does not exist.
 
 use std::cmp::Ordering;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as MemOrdering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
 
@@ -97,6 +99,10 @@ pub fn plan_merge(jobs: &mut [ClipJob], merge_output: &Path) -> Result<MergePlan
 /// Concatenates the finished parts into `merge_output`, re-bases the
 /// subtitle sidecar (subtitle mode only) and removes the scratch parts.
 ///
+/// `progress` is called with `(seconds_written, total_seconds)` as ffmpeg
+/// reports its position, so a frontend can show that a long concatenation
+/// is moving.
+///
 /// Returns `Ok(false)` if `stop_flag` cancelled the concatenation; the
 /// parts are then left in place rather than deleted, so the expensive
 /// per-clip encodes are not thrown away.
@@ -106,8 +112,9 @@ pub fn finish_merge(
     mode: OutputMode,
     options: &ProcessingOptions,
     stop_flag: &Arc<AtomicBool>,
+    progress: impl FnMut(f64, f64),
 ) -> Result<bool, CoreError> {
-    if !merge_clips(&plan.part_paths, merge_output, mode, options, stop_flag)? {
+    if !merge_clips(&plan.part_paths, merge_output, mode, options, stop_flag, progress)? {
         return Ok(false);
     }
     if mode == OutputMode::Subtitles {
@@ -188,6 +195,7 @@ pub fn merge_clips(
     mode: OutputMode,
     options: &ProcessingOptions,
     stop_flag: &Arc<AtomicBool>,
+    mut progress: impl FnMut(f64, f64),
 ) -> Result<bool, CoreError> {
     if inputs.is_empty() {
         return Err(CoreError::Other("Merging needs at least one clip".to_string()));
@@ -203,6 +211,10 @@ pub fn merge_clips(
 
     let parts = probe_parts(inputs)?;
     let uniform = parts_are_uniform(&parts);
+    // The merged length is the sum of the parts (they are joined
+    // back-to-back with no filler), which is what ffmpeg's reported output
+    // position is measured against.
+    let total_sec = parts.iter().map(|p| p.duration_sec).sum::<f64>();
 
     if mode == OutputMode::Subtitles && !uniform {
         return Err(CoreError::Other(
@@ -216,7 +228,7 @@ pub fn merge_clips(
     if uniform {
         let list_path = output.with_extension("concat.txt");
         write_concat_list(inputs, &list_path)?;
-        let result = concat_copy(&list_path, output, stop_flag);
+        let result = concat_copy(&list_path, output, total_sec, stop_flag, &mut progress);
         let _ = std::fs::remove_file(&list_path);
         match result {
             Ok(finished) => return Ok(finished),
@@ -233,7 +245,7 @@ pub fn merge_clips(
         }
     }
 
-    concat_reencode(&parts, output, options, stop_flag)
+    concat_reencode(&parts, output, options, total_sec, stop_flag, &mut progress)
 }
 
 /// Writes the concat demuxer's playlist. Paths are made absolute (the
@@ -255,7 +267,13 @@ fn write_concat_list(inputs: &[PathBuf], list_path: &Path) -> Result<(), CoreErr
     Ok(())
 }
 
-fn concat_copy(list_path: &Path, output: &Path, stop_flag: &Arc<AtomicBool>) -> Result<bool, CoreError> {
+fn concat_copy(
+    list_path: &Path,
+    output: &Path,
+    total_sec: f64,
+    stop_flag: &Arc<AtomicBool>,
+    progress: &mut dyn FnMut(f64, f64),
+) -> Result<bool, CoreError> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-i"])
         .arg(list_path)
@@ -269,14 +287,16 @@ fn concat_copy(list_path: &Path, output: &Path, stop_flag: &Arc<AtomicBool>) -> 
         // silent clips and overlay mode still work.
         .args(["-map", "0:v:0", "-map", "0:a:0?", "-map", "0:s:0?", "-c", "copy"])
         .arg(output);
-    run_ffmpeg(cmd, "Merge", stop_flag)
+    run_ffmpeg(cmd, "Merge", total_sec, stop_flag, progress)
 }
 
 fn concat_reencode(
     parts: &[PartInfo],
     output: &Path,
     options: &ProcessingOptions,
+    total_sec: f64,
     stop_flag: &Arc<AtomicBool>,
+    progress: &mut dyn FnMut(f64, f64),
 ) -> Result<bool, CoreError> {
     let target = parts
         .iter()
@@ -359,21 +379,45 @@ fn concat_reencode(
     }
     cmd.arg(output);
 
-    run_ffmpeg(cmd, "Merge", stop_flag)
+    run_ffmpeg(cmd, "Merge", total_sec, stop_flag, progress)
 }
 
 /// Runs an ffmpeg invocation to completion, polling `stop_flag` so a merge
-/// stays as cancellable as the per-clip processing it follows.
-fn run_ffmpeg(mut cmd: Command, what: &str, stop_flag: &Arc<AtomicBool>) -> Result<bool, CoreError> {
+/// stays as cancellable as the per-clip processing it follows, and
+/// forwarding ffmpeg's own position reports to `progress`.
+///
+/// `-progress pipe:1` makes ffmpeg print machine-readable `key=value`
+/// blocks on stdout (independent of `-v error`, which keeps the human log
+/// quiet). Merging a full dive can run for minutes -- long enough that no
+/// output at all reads as a hang -- and this is the only position
+/// information available, since the concatenation happens entirely inside
+/// ffmpeg rather than frame by frame in this process.
+fn run_ffmpeg(
+    mut cmd: Command,
+    what: &str,
+    total_sec: f64,
+    stop_flag: &Arc<AtomicBool>,
+    progress: &mut dyn FnMut(f64, f64),
+) -> Result<bool, CoreError> {
+    cmd.args(["-progress", "pipe:1", "-nostats"]);
     let mut child = cmd
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| CoreError::Ffmpeg(format!("Failed to start merge: {e}")))?;
     let stderr = spawn_stderr_capture(child.stderr.take().expect("stderr was piped"));
+    let positions = spawn_progress_reader(child.stdout.take().expect("stdout was piped"));
+
+    let mut last_sec = 0.0f64;
+    progress(0.0, total_sec);
 
     loop {
+        while let Ok(sec) = positions.try_recv() {
+            last_sec = sec;
+        }
+        progress(last_sec, total_sec);
+
         match child
             .try_wait()
             .map_err(|e| CoreError::Ffmpeg(format!("Error waiting for ffmpeg: {e}")))?
@@ -383,6 +427,7 @@ fn run_ffmpeg(mut cmd: Command, what: &str, stop_flag: &Arc<AtomicBool>) -> Resu
                 if !status.success() {
                     return Err(ffmpeg_failure(what, status, &stderr_text));
                 }
+                progress(total_sec, total_sec);
                 return Ok(true);
             }
             None => {
@@ -396,6 +441,30 @@ fn run_ffmpeg(mut cmd: Command, what: &str, stop_flag: &Arc<AtomicBool>) -> Resu
             }
         }
     }
+}
+
+/// Reads ffmpeg's `-progress` stream and forwards the output position in
+/// seconds. It runs on its own thread so a filled pipe can never stall
+/// ffmpeg while the caller sleeps between `try_wait` polls.
+fn spawn_progress_reader(stdout: ChildStdout) -> Receiver<f64> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            // `out_time_us` is microseconds; `out_time_ms` is ffmpeg's
+            // misnamed twin of it (also microseconds), taken as a fallback
+            // for builds that only emit the older key.
+            if key != "out_time_us" && key != "out_time_ms" {
+                continue;
+            }
+            if let Ok(micros) = value.trim().parse::<i64>() {
+                if tx.send(micros.max(0) as f64 / 1_000_000.0).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    rx
 }
 
 /// Rebuilds the sidecar `.srt` for a merged subtitle-mode output. The
@@ -590,7 +659,7 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let finished =
-            merge_clips(&[a.clone(), b.clone()], &output, OutputMode::Overlay, &default_options(), &stop).unwrap();
+            merge_clips(&[a.clone(), b.clone()], &output, OutputMode::Overlay, &default_options(), &stop, |_, _| {}).unwrap();
 
         assert!(finished);
         let merged = duration_of(&output);
@@ -599,6 +668,35 @@ mod tests {
         assert!(probe_video(&output).unwrap().has_audio);
         // The playlist is scratch, not a leftover for the user to find.
         assert!(!output.with_extension("concat.txt").exists());
+    }
+
+    /// A merge of a real dive runs for minutes inside a single ffmpeg call,
+    /// so the frontends have nothing to show unless ffmpeg's own position
+    /// reports come back out. Checks that they do, and that the last one
+    /// lands on the full merged length.
+    #[test]
+    fn reports_merge_progress_against_the_total_length() {
+        let dir = make_dir("progress");
+        let a = synth_clip(&dir, "a.mp4", 160, 120, 10, 1, true);
+        let b = synth_clip(&dir, "b.mp4", 160, 120, 10, 2, true);
+        let output = dir.join("merged.mp4");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reports: Vec<(f64, f64)> = Vec::new();
+        let options = default_options();
+        merge_clips(&[a.clone(), b.clone()], &output, OutputMode::Overlay, &options, &stop, |done, total| {
+            reports.push((done, total))
+        })
+        .unwrap();
+
+        let expected_total = duration_of(&a) + duration_of(&b);
+        let (last_done, last_total) = *reports.last().expect("progress was never reported");
+        assert!(
+            (last_total - expected_total).abs() < 0.35,
+            "reported total {last_total}s vs expected {expected_total}s"
+        );
+        assert!((last_done - last_total).abs() < 1e-6, "merge ended at {last_done}s of {last_total}s");
+        assert!(reports.iter().all(|(done, _)| *done >= 0.0));
     }
 
     /// Regression: the merge used to map every input stream (`-map 0`),
@@ -620,7 +718,7 @@ mod tests {
         let output = dir.join("merged.mp4");
         let stop = Arc::new(AtomicBool::new(false));
         let finished =
-            merge_clips(&[a, b], &output, OutputMode::Subtitles, &default_options(), &stop).unwrap();
+            merge_clips(&[a, b], &output, OutputMode::Subtitles, &default_options(), &stop, |_, _| {}).unwrap();
 
         assert!(finished);
         let types = stream_types(&output);
@@ -640,7 +738,7 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let finished =
-            merge_clips(&[a.clone(), b.clone()], &output, OutputMode::Overlay, &default_options(), &stop).unwrap();
+            merge_clips(&[a.clone(), b.clone()], &output, OutputMode::Overlay, &default_options(), &stop, |_, _| {}).unwrap();
 
         assert!(finished);
         let info = probe_video(&output).unwrap();
@@ -660,7 +758,7 @@ mod tests {
         let output = dir.join("merged.mp4");
 
         let stop = Arc::new(AtomicBool::new(false));
-        let err = merge_clips(&[a, b], &output, OutputMode::Subtitles, &default_options(), &stop).unwrap_err();
+        let err = merge_clips(&[a, b], &output, OutputMode::Subtitles, &default_options(), &stop, |_, _| {}).unwrap_err();
         assert!(err.to_string().contains("subtitle mode"), "unexpected error: {err}");
     }
 

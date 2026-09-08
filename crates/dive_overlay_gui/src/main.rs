@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use dive_overlay_core::csv_data::{
-    format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds, parse_fields,
+    format_duration, format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds,
+    parse_fields,
 };
 use dive_overlay_core::ffprobe::probe_video;
 use dive_overlay_core::merge::{finish_merge, plan_merge, MergePlan};
@@ -14,7 +15,7 @@ use dive_overlay_core::overlay::{build_overlay_lines, draw_depth_graph, draw_ove
 use dive_overlay_core::pipeline::{
     extract_frame_at, process_clip, Codec, EncoderInfo, OutputMode, Preset, ProcessingOptions,
 };
-use dive_overlay_core::sync::{compute_auto_sync, AutoSyncParams};
+use dive_overlay_core::sync::{compute_auto_sync, derive_output_path, AutoSyncParams};
 use dive_overlay_core::{ClipJob, DiveSample, RgbImage};
 
 mod update_check;
@@ -48,12 +49,13 @@ struct ClipEntry {
 
 /// Auto-sync settings: only the base clip is synced by hand, and every
 /// other clip's CSV sync point is derived from how much later it started
-/// recording (see `dive_overlay_core::sync::compute_auto_sync`).
+/// recording (see `dive_overlay_core::sync::compute_auto_sync`). The base
+/// clip's own CSV sync comes from its row in the clip table, so there is
+/// nothing to carry here beyond which clip it is.
 #[derive(Clone)]
 struct AutoSyncConfig {
     base_clip: PathBuf,
     base_video_sync_sec: f64,
-    base_csv_datetime: String,
 }
 
 /// Everything the background worker needs for one run, bundled up so a new
@@ -73,6 +75,10 @@ struct WorkerConfig {
 enum WorkerEvent {
     Log(String),
     Progress(f32),
+    /// Replaces the label next to the Start button. Used for phases that
+    /// are not per-frame processing (combining clips), which would
+    /// otherwise leave the UI reading "Processing..." with a still bar.
+    Status(String),
     Fps(f64),
     Encoder(String),
     /// `Ok(true)` = every clip finished, `Ok(false)` = stopped early via the
@@ -80,8 +86,11 @@ enum WorkerEvent {
     Done(Result<bool, String>),
 }
 
+/// The per-clip editor. Clips are only ever *added* in bulk (see
+/// `add_clips_bulk`), so this dialog exists solely to edit one existing
+/// entry -- hence a plain index rather than an optional one.
 struct ClipDialogState {
-    editing_index: Option<usize>,
+    editing_index: usize,
     video: String,
     video_sync: String,
     csv_sync: String,
@@ -90,20 +99,9 @@ struct ClipDialogState {
 }
 
 impl ClipDialogState {
-    fn new_add() -> Self {
-        Self {
-            editing_index: None,
-            video: String::new(),
-            video_sync: "0.0".to_string(),
-            csv_sync: "0:00".to_string(),
-            output: String::new(),
-            error: None,
-        }
-    }
-
     fn new_edit(idx: usize, entry: &ClipEntry) -> Self {
         Self {
-            editing_index: Some(idx),
+            editing_index: idx,
             video: entry.video_path.display().to_string(),
             video_sync: format!("{}", entry.video_sync_sec),
             csv_sync: entry.csv_sync_mmss.clone(),
@@ -188,7 +186,6 @@ struct App {
     auto_sync: bool,
     base_clip_index: usize,
     base_video_sync: String,
-    base_csv_datetime: String,
     entries: Vec<ClipEntry>,
     selected: Option<usize>,
     status: String,
@@ -223,7 +220,6 @@ impl Default for App {
             auto_sync: false,
             base_clip_index: 0,
             base_video_sync: "0.0".to_string(),
-            base_csv_datetime: String::new(),
             entries: Vec::new(),
             selected: None,
             status: "Ready".to_string(),
@@ -278,6 +274,7 @@ impl App {
                 match event {
                     WorkerEvent::Log(line) => self.log_lines.push(line),
                     WorkerEvent::Progress(p) => self.progress = p,
+                    WorkerEvent::Status(text) => self.status = text,
                     WorkerEvent::Fps(f) => self.fps = f,
                     WorkerEvent::Encoder(desc) => self.encoder_info = desc,
                     WorkerEvent::Done(result) => done = Some(result),
@@ -460,24 +457,83 @@ impl App {
                     });
                 ui.label("Video sync (s):");
                 ui.add(egui::TextEdit::singleline(&mut self.base_video_sync).desired_width(60.0));
-                ui.label("CSV date/time:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.base_csv_datetime)
-                        .desired_width(190.0)
-                        .hint_text("2025-07-05 15:32:55"),
-                );
+                ui.label("CSV sync:");
+                // Read-only: the anchor is the base clip's own CSV sync, so
+                // it is edited in the clip table (or the sync preview) like
+                // any other clip's, and only shown here to make clear which
+                // value the rest are derived from.
+                let base_csv_sync = self
+                    .entries
+                    .get(base_clip_index)
+                    .map(|e| e.csv_sync_mmss.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                ui.strong(base_csv_sync);
+                ui.weak("(from the clip table)");
             });
 
             self.base_clip_index = base_clip_index;
-            ui.weak("Only the base clip is synced by hand; the CSV sync values in the table are recomputed from how much later each clip started recording. Needs date and time columns in the CSV.");
+            ui.weak("Only the base clip is synced by hand; every other clip's CSV sync is derived from how much later it started recording, read from the clips' start timecode (or their creation time if any clip has none).");
+        }
+    }
+
+    /// Adds several clips at once, in the order they were recorded.
+    ///
+    /// A dive is normally one camera's worth of consecutive chapters, so the
+    /// per-clip dialog's sync fields are pure repetition here: every entry
+    /// starts at 0 and the user syncs only the base clip, letting auto-sync
+    /// place the rest. Sorting uses `creation_time` rather than the start
+    /// timecode auto-sync prefers, because it carries a date and so cannot
+    /// wrap at midnight; ordering is cosmetic either way, since `plan_merge`
+    /// re-sorts by dive time before joining.
+    fn add_clips_bulk(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Video", &["mp4", "MP4", "mov", "MOV"])
+            .pick_files()
+        else {
+            return;
+        };
+
+        let mut probed: Vec<(Option<i64>, String, PathBuf)> = paths
+            .into_iter()
+            .map(|path| {
+                let recorded_at = probe_video(&path)
+                    .ok()
+                    .and_then(|info| info.creation_time)
+                    .map(|t| t.timestamp_millis());
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (recorded_at, name, path)
+            })
+            .collect();
+        // Files whose timestamp could not be read fall back to name order
+        // rather than being scattered through the list.
+        probed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut added = 0;
+        for (_, _, video_path) in probed {
+            if self.entries.iter().any(|e| e.video_path == video_path) {
+                continue;
+            }
+            self.entries.push(ClipEntry {
+                output_path: derive_output_path(&video_path, None),
+                video_path,
+                video_sync_sec: 0.0,
+                csv_sync_mmss: "0:00".to_string(),
+            });
+            added += 1;
+        }
+        if added > 0 {
+            self.log_lines.push(format!("Added {added} clip(s)."));
         }
     }
 
     fn ui_clip_table(&mut self, ui: &mut egui::Ui) {
         ui.heading("Clips");
         ui.horizontal(|ui| {
-            if ui.button("Add clip").clicked() {
-                self.dialog = Some(ClipDialogState::new_add());
+            if ui.button("Add clips...").clicked() {
+                self.add_clips_bulk();
             }
             if ui.button("Edit clip").clicked() {
                 if let Some(idx) = self.selected {
@@ -575,17 +631,13 @@ impl App {
     }
 
     fn ui_clip_dialog(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = &mut self.dialog else { return };
+        let Some(dialog) = &mut self.dialog else {
+            return;
+        };
         let mut open = true;
         let mut submit = false;
         let mut cancel = false;
-        let title = if dialog.editing_index.is_some() {
-            "Edit clip"
-        } else {
-            "Add clip"
-        };
-
-        egui::Window::new(title)
+        egui::Window::new("Edit clip")
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -641,9 +693,11 @@ impl App {
                 Ok(entry) => {
                     let editing_index = dialog.editing_index;
                     self.dialog = None;
-                    match editing_index {
-                        Some(idx) => self.entries[idx] = entry,
-                        None => self.entries.push(entry),
+                    // The clip can have been removed while the dialog was
+                    // open; writing back into a shifted slot would edit the
+                    // wrong clip, so a stale index just drops the edit.
+                    if let Some(slot) = self.entries.get_mut(editing_index) {
+                        *slot = entry;
                     }
                 }
                 Err(e) => dialog.error = Some(e),
@@ -1003,15 +1057,9 @@ impl App {
                     .push("Error: the base clip's video sync must be a number.".to_string());
                 return;
             };
-            if self.base_csv_datetime.trim().is_empty() {
-                self.log_lines
-                    .push("Error: please enter the CSV date/time of the base clip's sync point.".to_string());
-                return;
-            }
             Some(AutoSyncConfig {
                 base_clip: entry.video_path.clone(),
                 base_video_sync_sec,
-                base_csv_datetime: self.base_csv_datetime.trim().to_string(),
             })
         } else {
             None
@@ -1091,9 +1139,12 @@ fn run_worker(
         let params = AutoSyncParams {
             base_clip: &auto.base_clip,
             base_video_sync_sec: auto.base_video_sync_sec,
-            base_csv_datetime: &auto.base_csv_datetime,
         };
-        compute_auto_sync(&csv_path, &column_map, &mut jobs, &params).map_err(|e| e.to_string())?;
+        let report = compute_auto_sync(&mut jobs, &times, &params).map_err(|e| e.to_string())?;
+        let _ = tx.send(WorkerEvent::Log(format!(
+            "Auto-sync: clips placed by {}.",
+            report.source.label()
+        )));
         for job in &jobs {
             let _ = tx.send(WorkerEvent::Log(format!(
                 "Auto-sync: {} -> CSV {}",
@@ -1103,6 +1154,9 @@ fn run_worker(
                     .unwrap_or_default(),
                 format_duration_precise(job.csv_sync_sec),
             )));
+        }
+        for warning in &report.warnings {
+            let _ = tx.send(WorkerEvent::Log(format!("Warning: {warning}")));
         }
         ctx.request_repaint();
     }
@@ -1213,10 +1267,29 @@ fn run_worker(
             merge_output.display()
         )));
         let _ = tx.send(WorkerEvent::Fps(0.0));
+        let _ = tx.send(WorkerEvent::Progress(0.0));
+        let _ = tx.send(WorkerEvent::Status("Combining clips...".to_string()));
         ctx.request_repaint();
 
-        let merged = finish_merge(plan, merge_output, options.mode, &options, cancel_flag)
-            .map_err(|e| format!("{e}{}", parts_note(Some(plan))))?;
+        let tx_merge = tx.clone();
+        let ctx_merge = ctx.clone();
+        let mut last_sent = std::time::Instant::now();
+        // The merge reports its position ten times a second; repainting the
+        // UI that often for a bar that moves slowly is wasted work.
+        let merged = finish_merge(plan, merge_output, options.mode, &options, cancel_flag, move |done, total| {
+            if total <= 0.0 || (last_sent.elapsed().as_secs_f64() < 0.25 && done < total) {
+                return;
+            }
+            let _ = tx_merge.send(WorkerEvent::Progress((done * 100.0 / total).min(100.0) as f32));
+            let _ = tx_merge.send(WorkerEvent::Status(format!(
+                "Combining clips... {} / {}",
+                format_duration(done.min(total)),
+                format_duration(total)
+            )));
+            ctx_merge.request_repaint();
+            last_sent = std::time::Instant::now();
+        })
+        .map_err(|e| format!("{e}{}", parts_note(Some(plan))))?;
         if !merged {
             let _ = tx.send(WorkerEvent::Log(format!(
                 "Cancelled: combining stopped.{}",

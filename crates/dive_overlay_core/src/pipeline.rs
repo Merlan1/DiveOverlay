@@ -440,6 +440,41 @@ fn spawn_decoder(video_path: &Path, fps: f64) -> Result<DecodeProcess, CoreError
     Ok(DecodeProcess { child, stdout, stderr })
 }
 
+/// Largest single write handed to the encoder's stdin pipe.
+///
+/// Windows fails `WriteFile` on a pipe with `ERROR_NO_SYSTEM_RESOURCES`
+/// (os error 1450) when one write is large enough to exhaust the kernel's
+/// non-paged pool -- a 5.3K rgb24 frame is ~36 MB, and a full-length dive
+/// eventually trips it even though the first frames go through. Splitting
+/// each frame into small writes keeps every request well under the limit.
+const PIPE_CHUNK: usize = 256 * 1024;
+
+/// Writes one raw frame to the encoder in `PIPE_CHUNK`-sized pieces,
+/// retrying a chunk that hits the transient Windows resource error above
+/// (the pool frees up as ffmpeg drains the pipe).
+fn write_frame(stdin: &mut ChildStdin, frame: &[u8]) -> std::io::Result<()> {
+    for chunk in frame.chunks(PIPE_CHUNK) {
+        let mut attempt = 0u64;
+        loop {
+            match stdin.write_all(chunk) {
+                Ok(()) => break,
+                Err(e) if is_transient_pipe_error(&e) && attempt < 10 => {
+                    attempt += 1;
+                    thread::sleep(std::time::Duration::from_millis(50 * attempt));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ERROR_NO_SYSTEM_RESOURCES` (1450) and `EINTR` both mean "try again",
+/// not "the encoder died".
+fn is_transient_pipe_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(1450)
+}
+
 struct EncodeProcess {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -586,7 +621,7 @@ pub fn process_clip(
         }
 
         if let Some(stdin) = encoder.stdin.as_mut() {
-            if let Err(e) = stdin.write_all(img.as_raw()) {
+            if let Err(e) = write_frame(stdin, img.as_raw()) {
                 // Almost always a broken pipe because the encoder died (bad
                 // codec, unwritable output, ...): its stderr holds the real
                 // reason, so surface that instead of just "broken pipe".

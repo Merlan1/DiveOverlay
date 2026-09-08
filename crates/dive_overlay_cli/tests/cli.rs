@@ -23,12 +23,20 @@ fn synth_clip(dir: &Path, name: &str, duration_secs: u32, fps: u32) -> PathBuf {
     path
 }
 
-fn synth_clip_with_creation_time(dir: &Path, name: &str, duration_secs: u32, fps: u32, creation_time: &str) -> PathBuf {
+fn synth_clip_with_timecode(
+    dir: &Path,
+    name: &str,
+    duration_secs: u32,
+    fps: u32,
+    creation_time: &str,
+    timecode: &str,
+) -> PathBuf {
     let path = dir.join(name);
     let video_src = format!("testsrc=size=160x120:rate={fps}:duration={duration_secs}");
     let status = StdCommand::new("ffmpeg")
         .args(["-y", "-f", "lavfi", "-i", &video_src])
         .args(["-metadata", &format!("creation_time={creation_time}")])
+        .args(["-timecode", timecode])
         .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
         .arg(&path)
         .status()
@@ -42,16 +50,6 @@ fn write_csv(dir: &Path) -> PathBuf {
     std::fs::write(
         &csv_path,
         "sample time (min),sample depth (m)\n0:00,1.0\n0:01,2.0\n0:02,3.0\n",
-    )
-    .unwrap();
-    csv_path
-}
-
-fn write_csv_with_datetime(dir: &Path) -> PathBuf {
-    let csv_path = dir.join("dive.csv");
-    std::fs::write(
-        &csv_path,
-        "date,time,sample time (min),sample depth (m)\n2025-07-05,09:58:00,0:00,1.0\n2025-07-05,09:59:00,1:00,2.0\n",
     )
     .unwrap();
     csv_path
@@ -100,9 +98,15 @@ fn multi_clip_via_repeated_clip_flag() {
 #[test]
 fn auto_sync_end_to_end() {
     let dir = make_dir("auto_sync");
-    let clip1 = synth_clip_with_creation_time(&dir, "c1.mp4", 1, 5, "2025-07-05T10:00:00Z");
-    let clip2 = synth_clip_with_creation_time(&dir, "c2.mp4", 1, 5, "2025-07-05T10:05:00Z");
-    let csv = write_csv_with_datetime(&dir);
+    // Timecodes 5 minutes apart but creation_times 9 minutes apart, so the
+    // derived sync below only comes out at 5:00 if auto-sync read the
+    // timecode -- which is what it must do when every clip has one.
+    let clip1 =
+        synth_clip_with_timecode(&dir, "c1.mp4", 1, 5, "2025-07-05T08:00:00Z", "10:00:00:00");
+    let clip2 =
+        synth_clip_with_timecode(&dir, "c2.mp4", 1, 5, "2025-07-05T08:09:00Z", "10:05:00:00");
+    // An elapsed-time-only CSV: auto-sync no longer needs date/clock columns.
+    let csv = write_csv(&dir);
 
     let clip1_spec = format!("{}|0|0:00", clip1.display());
     let clip2_spec = format!("{}|0|0:00", clip2.display());
@@ -115,9 +119,15 @@ fn auto_sync_end_to_end() {
         .arg("--auto-sync")
         .args(["--base-clip"])
         .arg(&clip1)
-        .args(["--base-video-sync-sec", "0"])
-        .args(["--base-csv-datetime", "2025-07-05 10:00:00"]);
-    cmd.assert().success();
+        .args(["--base-video-sync-sec", "0"]);
+    let assert = cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("placed by start timecode"),
+        "stdout: {stdout}"
+    );
+    // Second clip started 5 minutes after the base, whose own sync is 0:00.
+    assert!(stdout.contains("c2.mp4 -> CSV 05:00"), "stdout: {stdout}");
 
     assert!(clip1.with_file_name("c1_overlay.mp4").exists());
     assert!(clip2.with_file_name("c2_overlay.mp4").exists());
