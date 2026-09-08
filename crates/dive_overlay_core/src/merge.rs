@@ -578,6 +578,7 @@ mod tests {
     }
 
     fn default_options() -> ProcessingOptions {
+        use crate::pipeline::OutputResolution;
         ProcessingOptions {
             fields: Vec::new(),
             codec: crate::pipeline::Codec::Auto,
@@ -586,6 +587,7 @@ mod tests {
             show_graph: false,
             mode: OutputMode::Overlay,
             interpolate: false,
+            resolution: OutputResolution::Original,
         }
     }
 

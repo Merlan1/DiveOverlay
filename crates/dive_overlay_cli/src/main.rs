@@ -13,7 +13,7 @@ use dive_overlay_core::csv_data::{
 };
 use dive_overlay_core::ffprobe::ensure_ffmpeg_available;
 use dive_overlay_core::merge::{finish_merge, plan_merge};
-use dive_overlay_core::pipeline::{process_clip, Codec, OutputMode, Preset, ProcessingOptions};
+use dive_overlay_core::pipeline::{process_clip, Codec, OutputMode, OutputResolution, Preset, ProcessingOptions};
 use dive_overlay_core::sync::{compute_auto_sync, derive_output_path, parse_clip_spec, AutoSyncParams};
 use dive_overlay_core::ClipJob;
 
@@ -64,6 +64,13 @@ struct Args {
     /// matching hardware is found. Ignored for other codecs.
     #[arg(long)]
     hw_accel: bool,
+
+    /// Output resolution: original, 4k, 1080p, 720p. Downscales only --
+    /// footage already at or below the chosen size is left alone. Preserves
+    /// the aspect ratio, and is ignored in subtitles mode (which re-muxes
+    /// losslessly and cannot resize)
+    #[arg(long, default_value = "original")]
+    resolution: String,
 
     /// Shows a small depth profile (graph)
     #[arg(long)]
@@ -192,6 +199,13 @@ fn main() -> Result<()> {
         )
     })?;
 
+    let resolution = OutputResolution::parse(&args.resolution).ok_or_else(|| {
+        anyhow!(
+            "Invalid --resolution value: {} (expected: original, 4k, 1080p, 720p)",
+            args.resolution
+        )
+    })?;
+
     let options = ProcessingOptions {
         fields,
         codec,
@@ -200,6 +214,7 @@ fn main() -> Result<()> {
         show_graph: args.show_graph,
         mode,
         interpolate: args.interpolate,
+        resolution,
     };
     let stop_flag = Arc::new(AtomicBool::new(false));
 

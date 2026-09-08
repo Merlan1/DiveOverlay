@@ -13,7 +13,8 @@ use dive_overlay_core::ffprobe::probe_video;
 use dive_overlay_core::merge::{finish_merge, plan_merge, MergePlan};
 use dive_overlay_core::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay, OverlayCache};
 use dive_overlay_core::pipeline::{
-    extract_frame_at, process_clip, Codec, EncoderInfo, OutputMode, Preset, ProcessingOptions,
+    extract_frame_at, process_clip, Codec, EncoderInfo, OutputMode, OutputResolution, Preset, ProcessingOptions,
+    OUTPUT_RESOLUTIONS,
 };
 use dive_overlay_core::sync::{compute_auto_sync, derive_output_path, AutoSyncParams};
 use dive_overlay_core::{ClipJob, DiveSample, RgbImage};
@@ -178,6 +179,7 @@ struct App {
     preset: String,
     hw_accel: bool,
     column_map: String,
+    resolution: OutputResolution,
     show_graph: bool,
     interpolate: bool,
     mode: OutputMode,
@@ -212,6 +214,7 @@ impl Default for App {
             preset: "veryfast".to_string(),
             hw_accel: true,
             column_map: String::new(),
+            resolution: OutputResolution::Original,
             show_graph: false,
             interpolate: false,
             mode: OutputMode::Overlay,
@@ -366,6 +369,24 @@ impl App {
             });
         });
         let subtitle_mode = self.mode == OutputMode::Subtitles;
+        ui.horizontal(|ui| {
+            // Subtitle mode re-muxes losslessly, so there is nothing to
+            // resize -- greyed out for the same reason as codec and preset.
+            ui.add_enabled_ui(!subtitle_mode, |ui| {
+                ui.label("Resolution:");
+                egui::ComboBox::from_id_salt("resolution")
+                    .selected_text(self.resolution.label())
+                    .show_ui(ui, |ui| {
+                        for opt in OUTPUT_RESOLUTIONS {
+                            ui.selectable_value(&mut self.resolution, opt, opt.label());
+                        }
+                    });
+            })
+            .response
+            .on_hover_text(
+                "Downscales the output. Footage already at or below the chosen size is left                  untouched, and the aspect ratio is always preserved. Smaller frames encode                  much faster, and can bring a hardware encoder into range that the original                  resolution was too large for.",
+            );
+        });
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!subtitle_mode, |ui| {
                 ui.label("Codec:");
@@ -1075,6 +1096,7 @@ impl App {
                 preset,
                 hw_accel: self.hw_accel,
                 show_graph: self.show_graph,
+                resolution: self.resolution,
                 mode: self.mode,
                 interpolate: self.interpolate,
             },
@@ -1341,6 +1363,7 @@ mod tests {
                 preset: Preset::VeryFast,
                 hw_accel: false,
                 show_graph: false,
+                resolution: OutputResolution::Original,
                 mode: OutputMode::Overlay,
                 interpolate: false,
             },

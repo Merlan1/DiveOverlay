@@ -211,12 +211,16 @@ static HW_PROBE_CACHE: HwProbeCache = OnceLock::new();
 ///
 /// The probe MUST run at the frame size the job will really encode. A
 /// hardware encoder's maximum resolution is a property of the silicon, not
-/// of the ffmpeg build: an AMD iGPU here initializes `h264_amf` happily at
-/// 4096x2304 and refuses 4608x2592 with `encoder->Init() failed with error
-/// 5`. Probing at a fixed small size therefore reported "available" and the
-/// real encode then died at init, failing the whole job -- for exactly the
-/// 5.3K GoPro footage this tool is pointed at. Sizing the probe to the job
-/// turns that into a silent, correct fallback to software.
+/// of the ffmpeg build, and the limit is a clamp on each *dimension*
+/// independently rather than a budget of total pixels: the AMD iGPU here
+/// encodes 4096x4096 (16.8 MP) with `h264_amf` but refuses 4608x2592
+/// (11.9 MP) with `encoder->Init() failed with error 5`, because 4608
+/// exceeds its per-axis maximum of 4096. Probing at a fixed small size
+/// therefore reported "available" and the real encode then died at init,
+/// failing the whole job -- for exactly the 5.3K GoPro footage this tool is
+/// pointed at, which busts the limit on width alone. Only a probe at the
+/// job's own width and height can see that, and it turns the failure into a
+/// silent, correct fallback to software.
 fn probe_hw_encoder(encoder_name: &'static str, pix_fmt: &str, width: u32, height: u32) -> bool {
     let cache = HW_PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (encoder_name, width, height);
@@ -324,6 +328,117 @@ impl OutputMode {
     }
 }
 
+/// Frame size of the burned-in overlay output. `Original` keeps whatever
+/// the decoder produces; the fixed rungs scale the picture *down* to fit a
+/// box of that size, never up, so picking 4K for 1080p footage is a no-op
+/// rather than a blurry upscale.
+///
+/// The scale is applied in the decoder (see `spawn_decoder`), not the
+/// encoder, and that placement is the whole point of the feature. Measured
+/// on the 5.3K test clip, the burned-in path spends ~63% of its time in
+/// libx264, ~19% shuttling rgb24 frames through the two pipes, ~13% in the
+/// HEVC decode and only ~6% drawing. Scaling before the pipe shrinks the
+/// encode, the pipe traffic (47.6 MB -> 28.3 MB per frame at 4K) and the
+/// draw area together; scaling in the encoder would shrink only the encode.
+/// It also drops the frame size below the hardware encoders' per-axis
+/// limits -- `resolve_encoder` probes at the *output* size, so a 5.3K job
+/// that could only ever use software silently gains the AMF path at 4K.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputResolution {
+    Original,
+    Uhd4k,
+    Fhd1080p,
+    Hd720p,
+}
+
+/// Every selectable value, in menu order -- shared by the CLI's help text
+/// and the GUI's combo box so the two can't drift apart.
+pub const OUTPUT_RESOLUTIONS: [OutputResolution; 4] = [
+    OutputResolution::Original,
+    OutputResolution::Uhd4k,
+    OutputResolution::Fhd1080p,
+    OutputResolution::Hd720p,
+];
+
+impl OutputResolution {
+    /// Returns `None` for unrecognized names so callers can report a typo
+    /// instead of silently keeping the original size.
+    pub fn parse(s: &str) -> Option<OutputResolution> {
+        match s.trim().to_lowercase().as_str() {
+            "" | "original" | "source" | "native" => Some(OutputResolution::Original),
+            "4k" | "uhd" | "2160p" | "2160" => Some(OutputResolution::Uhd4k),
+            "1080p" | "1080" | "fhd" => Some(OutputResolution::Fhd1080p),
+            "720p" | "720" | "hd" => Some(OutputResolution::Hd720p),
+            _ => None,
+        }
+    }
+
+    /// The canonical name, i.e. the one `parse` round-trips.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputResolution::Original => "original",
+            OutputResolution::Uhd4k => "4k",
+            OutputResolution::Fhd1080p => "1080p",
+            OutputResolution::Hd720p => "720p",
+        }
+    }
+
+    /// Label for the GUI combo box.
+    pub fn label(self) -> &'static str {
+        match self {
+            OutputResolution::Original => "Original",
+            OutputResolution::Uhd4k => "4K (3840x2160)",
+            OutputResolution::Fhd1080p => "1080p (1920x1080)",
+            OutputResolution::Hd720p => "720p (1280x720)",
+        }
+    }
+
+    /// The target box as (long side, short side), or `None` for `Original`.
+    fn box_sides(self) -> Option<(u32, u32)> {
+        match self {
+            OutputResolution::Original => None,
+            OutputResolution::Uhd4k => Some((3840, 2160)),
+            OutputResolution::Fhd1080p => Some((1920, 1080)),
+            OutputResolution::Hd720p => Some((1280, 720)),
+        }
+    }
+
+    /// The frame size a `width`x`height` source becomes under this setting.
+    ///
+    /// The box is oriented to match the source, so portrait footage is
+    /// limited by its own short side (1080p portrait is 1080x1920) instead
+    /// of being squeezed into a landscape box. The aspect ratio is always
+    /// preserved -- the picture is fitted inside the box, never stretched or
+    /// cropped to it -- and both dimensions are rounded to even numbers,
+    /// which yuv420p chroma subsampling requires.
+    pub fn target_dimensions(self, width: u32, height: u32) -> (u32, u32) {
+        let Some((long, short)) = self.box_sides() else {
+            return (width, height);
+        };
+        if width == 0 || height == 0 {
+            return (width, height);
+        }
+        let (box_w, box_h) = if width >= height { (long, short) } else { (short, long) };
+        if width <= box_w && height <= box_h {
+            return (width, height);
+        }
+        let factor = (box_w as f64 / width as f64).min(box_h as f64 / height as f64);
+        (
+            round_to_even(width as f64 * factor),
+            round_to_even(height as f64 * factor),
+        )
+    }
+}
+
+/// Rounds a scaled dimension to an even number of pixels, with a floor of 2:
+/// yuv420p halves both axes for the chroma planes, so an odd width or height
+/// is rejected by the encoder outright.
+fn round_to_even(value: f64) -> u32 {
+    let rounded = value.round().max(2.0) as u32;
+    let even = if rounded.is_multiple_of(2) { rounded } else { rounded - 1 };
+    even.max(2)
+}
+
 #[derive(Debug, Clone)]
 pub struct ProcessingOptions {
     pub fields: Vec<Field>,
@@ -333,6 +448,9 @@ pub struct ProcessingOptions {
     pub show_graph: bool,
     pub mode: OutputMode,
     pub interpolate: bool,
+    /// Ignored in `OutputMode::Subtitles`, which re-muxes losslessly and so
+    /// cannot resize without defeating its own purpose.
+    pub resolution: OutputResolution,
 }
 
 /// Reads an ffmpeg child's stderr to EOF on a background thread (so the
@@ -421,12 +539,24 @@ struct DecodeProcess {
 /// the output against the audio. `-nostdin` is safe here because this
 /// process's stdin is unused -- do not use it on the encoder, whose stdin
 /// carries real frame data.
-fn spawn_decoder(video_path: &Path, fps: f64) -> Result<DecodeProcess, CoreError> {
+///
+/// `scale_to` downsizes the picture here, in the decoder, rather than in the
+/// encoder: every later stage (the rgb24 pipe, the overlay drawing, the
+/// encode) then works on the smaller frame. The target is computed by
+/// `OutputResolution::target_dimensions` and passed in explicitly rather
+/// than expressed as an ffmpeg filter expression, so this process and
+/// ffmpeg cannot disagree about the frame size -- the read buffer in
+/// `process_clip` is sized from the same pair of numbers.
+fn spawn_decoder(video_path: &Path, fps: f64, scale_to: Option<(u32, u32)>) -> Result<DecodeProcess, CoreError> {
     let fps_arg = format!("{fps}");
-    let mut child = Command::new("ffmpeg")
-        .args(["-nostdin", "-v", "error", "-i"])
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-nostdin", "-v", "error", "-i"])
         .arg(video_path)
-        .args(["-an", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .args(["-an", "-f", "rawvideo", "-pix_fmt", "rgb24"]);
+    if let Some((width, height)) = scale_to {
+        cmd.args(["-vf", &format!("scale={width}:{height}")]);
+    }
+    let mut child = cmd
         .args(["-fps_mode", "cfr", "-r", &fps_arg, "pipe:1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -570,12 +700,19 @@ pub fn process_clip(
         )));
     }
 
-    let mut decoder = spawn_decoder(&job.video_path, info.fps)?;
+    // Everything downstream of the decoder works at the *output* size: the
+    // pipe buffer, the overlay drawing, and -- via `resolve_encoder` -- the
+    // hardware-encoder probe, which is why downscaling can turn a job that
+    // had no hardware path at its native size into one that does.
+    let (out_width, out_height) = options.resolution.target_dimensions(info.width, info.height);
+    let scale_to = ((out_width, out_height) != (info.width, info.height)).then_some((out_width, out_height));
+
+    let mut decoder = spawn_decoder(&job.video_path, info.fps, scale_to)?;
     let mut encoder = spawn_encoder(
         &job.output_path,
         &job.video_path,
-        info.width,
-        info.height,
+        out_width,
+        out_height,
         info.fps,
         options.codec,
         options.preset,
@@ -583,7 +720,7 @@ pub fn process_clip(
     )?;
     on_encoder(&encoder.info);
 
-    let frame_size = info.width as usize * info.height as usize * 3;
+    let frame_size = out_width as usize * out_height as usize * 3;
     let total_estimate = info.estimated_frames.unwrap_or(0);
 
     let mut buf = vec![0u8; frame_size];
@@ -608,7 +745,7 @@ pub fn process_clip(
             }
         }
 
-        let mut img = RgbImage::from_raw(info.width, info.height, std::mem::take(&mut buf))
+        let mut img = RgbImage::from_raw(out_width, out_height, std::mem::take(&mut buf))
             .ok_or_else(|| CoreError::Ffmpeg("Invalid frame size".to_string()))?;
 
         let video_sec = frame_idx as f64 / info.fps;
@@ -872,6 +1009,7 @@ mod tests {
             show_graph: false,
             mode: OutputMode::Overlay,
             interpolate: false,
+            resolution: OutputResolution::Original,
         };
         let err = process_clip(&job, &[], &[], &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
             .unwrap_err();
@@ -903,6 +1041,7 @@ mod tests {
             show_graph: false,
             mode: OutputMode::Overlay,
             interpolate: false,
+            resolution: OutputResolution::Original,
         };
         let err = process_clip(&job, &[], &[], &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
             .unwrap_err();
@@ -948,6 +1087,7 @@ mod tests {
             show_graph: false,
             mode: OutputMode::Overlay,
             interpolate: false,
+            resolution: OutputResolution::Original,
         };
         let completed =
             process_clip(&job, &samples, &times, &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
@@ -994,6 +1134,7 @@ mod tests {
             show_graph: false,
             mode: OutputMode::Overlay,
             interpolate: false,
+            resolution: OutputResolution::Original,
         };
         process_clip(&job, &samples, &times, &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
             .unwrap();
@@ -1001,6 +1142,159 @@ mod tests {
         let info = probe_video(&output).unwrap();
         let duration = info.duration_sec.expect("output duration");
         assert!((duration - 1.9).abs() < 0.25, "expected ~1.9s of video, got {duration}s");
+    }
+
+    #[test]
+    fn output_resolution_parse_round_trips_and_rejects_typos() {
+        for res in OUTPUT_RESOLUTIONS {
+            assert_eq!(OutputResolution::parse(res.as_str()), Some(res));
+        }
+        assert_eq!(OutputResolution::parse(""), Some(OutputResolution::Original));
+        assert_eq!(OutputResolution::parse("2160P"), Some(OutputResolution::Uhd4k));
+        assert_eq!(OutputResolution::parse("4K"), Some(OutputResolution::Uhd4k));
+        assert_eq!(OutputResolution::parse("1440p"), None);
+        assert_eq!(OutputResolution::parse("huge"), None);
+    }
+
+    /// The whole point of the 4K rung on this project's target footage: 5.3K
+    /// GoPro video is 16:9, so it lands exactly on 3840x2160 -- and that is
+    /// under every hardware encoder's per-axis limit, which 5312 is not.
+    #[test]
+    fn output_resolution_scales_5k_gopro_footage_to_exactly_16_by_9() {
+        assert_eq!(OutputResolution::Uhd4k.target_dimensions(5312, 2988), (3840, 2160));
+        assert_eq!(OutputResolution::Fhd1080p.target_dimensions(5312, 2988), (1920, 1080));
+        assert_eq!(OutputResolution::Hd720p.target_dimensions(5312, 2988), (1280, 720));
+        assert_eq!(
+            OutputResolution::Original.target_dimensions(5312, 2988),
+            (5312, 2988)
+        );
+    }
+
+    /// Selecting a rung larger than the source must not upscale: a blurry
+    /// stretch is never what "output at 4K" is asking for.
+    #[test]
+    fn output_resolution_never_upscales() {
+        assert_eq!(OutputResolution::Uhd4k.target_dimensions(1920, 1080), (1920, 1080));
+        assert_eq!(OutputResolution::Fhd1080p.target_dimensions(1280, 720), (1280, 720));
+        assert_eq!(
+            OutputResolution::Fhd1080p.target_dimensions(1920, 1080),
+            (1920, 1080),
+            "a source exactly at the target is already the target"
+        );
+    }
+
+    /// The target box is oriented like the source, so "1080p" on portrait
+    /// footage means 1080 across, not 1080 tall (which would throw away
+    /// three quarters of the picture's detail).
+    #[test]
+    fn output_resolution_orients_the_box_to_portrait_sources() {
+        assert_eq!(OutputResolution::Fhd1080p.target_dimensions(2988, 5312), (1080, 1920));
+        assert_eq!(OutputResolution::Uhd4k.target_dimensions(2988, 5312), (2160, 3840));
+    }
+
+    /// Aspect ratios that don't match the box are fitted inside it, never
+    /// stretched or cropped, and both dimensions stay even for yuv420p.
+    #[test]
+    fn output_resolution_preserves_aspect_ratio_with_even_dimensions() {
+        // 4:3 fits on width; 1440x1080 keeps 4:3 exactly.
+        assert_eq!(OutputResolution::Fhd1080p.target_dimensions(4000, 3000), (1440, 1080));
+        // 21:9 fits on width, and the odd result is rounded down to even.
+        let (w, h) = OutputResolution::Fhd1080p.target_dimensions(5120, 2145);
+        assert_eq!(w, 1920);
+        assert_eq!(h % 2, 0, "odd heights are rejected by yuv420p: got {h}");
+        let source_ratio = 5120.0 / 2145.0;
+        let scaled_ratio = w as f64 / h as f64;
+        assert!(
+            (source_ratio - scaled_ratio).abs() < 0.01,
+            "aspect ratio drifted: {source_ratio} -> {scaled_ratio}"
+        );
+    }
+
+    /// A zero dimension means ffprobe told us nothing; `process_clip` rejects
+    /// that separately, so scaling must not divide by it here.
+    #[test]
+    fn output_resolution_passes_through_a_zero_frame_size() {
+        assert_eq!(OutputResolution::Uhd4k.target_dimensions(0, 2988), (0, 2988));
+        assert_eq!(OutputResolution::Uhd4k.target_dimensions(5312, 0), (5312, 0));
+    }
+
+    /// End-to-end proof that the decoder-side scale actually lands: the
+    /// frame buffer, the `-s` given to the encoder and ffmpeg's own filter
+    /// all have to agree, and a mismatch would either tear the picture or
+    /// desynchronize the rgb24 stream rather than fail loudly.
+    #[test]
+    fn downscales_the_output_to_the_selected_resolution() {
+        let dir = make_test_dir("resolution_downscale");
+        let clip = synth_clip_res(&dir, "input.mp4", 1920, 1080, 2, 5);
+        let output = dir.join("out.mp4");
+
+        let samples = vec![sample(0.0, 1.0), sample(10.0, 2.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let job = ClipJob {
+            video_path: clip,
+            output_path: output.clone(),
+            video_sync_sec: 0.0,
+            csv_sync_sec: 0.0,
+            video_start_utc: None,
+        };
+        let options = ProcessingOptions {
+            fields: vec![Field::Depth],
+            codec: Codec::Auto,
+            preset: Preset::UltraFast,
+            hw_accel: false,
+            show_graph: false,
+            mode: OutputMode::Overlay,
+            interpolate: false,
+            resolution: OutputResolution::Hd720p,
+        };
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let completed = process_clip(&job, &samples, &times, &options, &stop_flag, |_, _| {}, |_| {})
+            .expect("processing a downscaled clip should succeed");
+        assert!(completed);
+
+        let probed = probe_video(&output).expect("probing the downscaled output");
+        assert_eq!((probed.width, probed.height), (1280, 720));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Original` must leave the frame size exactly alone -- no scale filter,
+    /// no even-rounding, no surprise resample of odd-sized footage.
+    #[test]
+    fn original_resolution_leaves_the_frame_size_untouched() {
+        let dir = make_test_dir("resolution_original");
+        let clip = synth_clip_res(&dir, "input.mp4", 640, 480, 2, 5);
+        let output = dir.join("out.mp4");
+
+        let samples = vec![sample(0.0, 1.0)];
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let job = ClipJob {
+            video_path: clip,
+            output_path: output.clone(),
+            video_sync_sec: 0.0,
+            csv_sync_sec: 0.0,
+            video_start_utc: None,
+        };
+        let options = ProcessingOptions {
+            fields: vec![Field::Depth],
+            codec: Codec::Auto,
+            preset: Preset::UltraFast,
+            hw_accel: false,
+            show_graph: false,
+            mode: OutputMode::Overlay,
+            interpolate: false,
+            resolution: OutputResolution::Original,
+        };
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        process_clip(&job, &samples, &times, &options, &stop_flag, |_, _| {}, |_| {})
+            .expect("processing at the original resolution should succeed");
+
+        let probed = probe_video(&output).expect("probing the output");
+        assert_eq!((probed.width, probed.height), (640, 480));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1179,6 +1473,7 @@ mod tests {
             show_graph: false,
             mode: OutputMode::Overlay,
             interpolate: false,
+            resolution: OutputResolution::Original,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -1244,6 +1539,7 @@ mod tests {
             show_graph: true,
             mode: OutputMode::Overlay,
             interpolate: false,
+            resolution: OutputResolution::Original,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -1304,6 +1600,7 @@ mod tests {
             show_graph: false,
             mode: OutputMode::Overlay,
             interpolate: false,
+            resolution: OutputResolution::Original,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_for_progress = stop_flag.clone();
@@ -1350,6 +1647,7 @@ mod tests {
             show_graph: false,
             mode: OutputMode::Overlay,
             interpolate: false,
+            resolution: OutputResolution::Original,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -1390,6 +1688,7 @@ mod tests {
             show_graph: false,
             mode: OutputMode::Subtitles,
             interpolate: false,
+            resolution: OutputResolution::Original,
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
 
