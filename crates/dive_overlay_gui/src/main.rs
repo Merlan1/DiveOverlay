@@ -952,7 +952,7 @@ impl App {
         let lines = build_overlay_lines(&fields, samples, times, csv_sync_sec, self.interpolate);
         draw_overlay(&mut frame, &lines, &mut OverlayCache::new());
         if self.show_graph {
-            draw_depth_graph(&mut frame, samples, times, csv_sync_sec, 600.0);
+            draw_depth_graph(&mut frame, samples, times, csv_sync_sec, &mut OverlayCache::new());
         }
 
         let (w, h) = frame.dimensions();

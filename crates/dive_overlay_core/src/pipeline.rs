@@ -828,7 +828,7 @@ pub fn process_clip(
         let lines = build_overlay_lines(&options.fields, samples, times, dive_sec, options.interpolate);
         draw_overlay_yuv(&mut img, &lines, &mut overlay_cache, range);
         if options.show_graph {
-            draw_depth_graph_yuv(&mut img, samples, times, dive_sec, 600.0, range);
+            draw_depth_graph_yuv(&mut img, samples, times, dive_sec, range, &mut overlay_cache);
         }
 
         if let Some(stdin) = encoder.stdin.as_mut() {

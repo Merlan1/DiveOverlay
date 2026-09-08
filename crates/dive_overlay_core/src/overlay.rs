@@ -148,6 +148,7 @@ fn cubic_hermite(t: f64, prev: Option<(f64, f64)>, p0: (f64, f64), p1: (f64, f64
 #[derive(Default)]
 pub struct OverlayCache {
     tile: Option<CachedTile>,
+    graph: Option<CachedGraph>,
 }
 
 struct CachedTile {
@@ -168,6 +169,16 @@ struct CachedTile {
     yuv: Option<(ColorRange, YuvTile)>,
 }
 
+/// The depth graph's counterpart to `CachedTile`. It is keyed on a whole
+/// `GraphPlan` rather than on the info box's line strings because the graph
+/// has no equally cheap stand-in: its picture depends on every plotted point.
+struct CachedGraph {
+    plan: GraphPlan,
+    image: RgbaImage,
+    /// Built on first use and kept as long as `image` is, tagged with the
+    /// range it was built for -- exactly as `CachedTile::yuv` is.
+    yuv: Option<(ColorRange, YuvTile)>,
+}
 impl OverlayCache {
     pub fn new() -> Self {
         Self::default()
@@ -265,6 +276,12 @@ fn render_tile(lines: &[String], x: i32, y: i32, metrics: &OverlayMetrics) -> Ca
 /// Alpha-composites `tile` (its own per-pixel alpha) onto `img` at `(x, y)`,
 /// clipped to image bounds -- the per-frame counterpart to `render_tile`,
 /// doing only the blend math with no font/text work.
+///
+/// Every overlay element -- the info box and the depth graph alike -- reaches
+/// the frame through this and `composite_tile_yuv`, which is what lets one set
+/// of drawing code serve both a packed-RGB frame (the GUI preview) and the
+/// planar YUV frames the pipeline moves between its ffmpeg subprocesses: only
+/// the two composites know anything about pixel layout.
 fn composite_tile(img: &mut RgbImage, tile: &RgbaImage, x: i32, y: i32) {
     let (img_w, img_h) = img.dimensions();
     let (tile_w, tile_h) = tile.dimensions();
@@ -354,6 +371,7 @@ pub fn draw_overlay_yuv(frame: &mut Yuv420Frame, lines: &[String], cache: &mut O
 /// Frame-relative sizing for the depth graph, on the same factor as
 /// `OverlayMetrics` -- its axis labels were a hard-coded 14px and its strokes
 /// a single pixel, which is invisible on a 5K frame.
+#[derive(PartialEq)]
 struct GraphMetrics {
     font: PxScale,
     inset: i32,
@@ -593,19 +611,6 @@ fn blend_u8(src: u8, dst: u8, alpha: u8) -> u8 {
 /// detecting the footage's colour matrix.
 const DEPTH_CURVE_GREY: u8 = 210;
 
-/// A rendered overlay element and where it goes on the frame.
-///
-/// Both the info box and the depth graph are drawn into one of these, and the
-/// frame itself is only ever touched by a composite. That is what lets the
-/// same drawing code serve a packed-RGB frame (the GUI's preview) and the
-/// planar YUV frames the pipeline moves between its ffmpeg subprocesses --
-/// only `composite_tile` and `composite_tile_yuv` know about pixel layout.
-struct PositionedTile {
-    image: RgbaImage,
-    x: i32,
-    y: i32,
-}
-
 /// Rounds a tile's placement down to an even coordinate.
 ///
 /// 4:2:0 stores one chroma sample per 2x2 luma block, so a tile starting on
@@ -615,22 +620,33 @@ fn align_to_chroma_grid(value: i32) -> i32 {
     value & !1
 }
 
-/// Renders the depth-profile graph into its own tile, or `None` when there is
-/// nothing to plot.
+/// Everything the graph's drawing step reads: the tile is a pure function of
+/// this, which is what lets it double as the cache key. Unlike the info box --
+/// whose text changes about once a second and can be compared as strings --
+/// the graph's picture changes whenever a plotted point moves by a pixel, so
+/// the key has to be the plotted geometry itself.
+#[derive(PartialEq)]
+struct GraphPlan {
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    metrics: GraphMetrics,
+    /// The polyline in tile-local pixels. Quantizing here rather than at draw
+    /// time is what makes the key exact: two frames with the same plan
+    /// rasterize identically because they rasterize from the same numbers.
+    points: Vec<(i32, i32)>,
+    min_label: String,
+    max_label: String,
+}
+
+/// Works out what the depth-profile graph should look like, or `None` when
+/// there is nothing to plot.
 ///
-/// The graph used to draw straight onto the frame. Rendering to a tile means
-/// all the per-pixel work happens on a buffer a few percent of the frame's
-/// size (better cache locality), and -- more importantly -- it leaves
-/// compositing as the single operation that has to know the frame's pixel
-/// format.
-fn render_graph_tile(
-    samples: &[DiveSample],
-    times: &[f64],
-    dive_sec: f64,
-    window_sec: f64,
-    frame_w: u32,
-    frame_h: u32,
-) -> Option<PositionedTile> {
+/// The plot covers the whole dive so far -- elapsed zero to `dive_sec` -- not
+/// a trailing window, so the descent stays on screen for the entire dive and
+/// the shape the viewer sees is the shape of the dive.
+fn plan_graph(samples: &[DiveSample], times: &[f64], dive_sec: f64, frame_w: u32, frame_h: u32) -> Option<GraphPlan> {
     if samples.is_empty() {
         return None;
     }
@@ -643,12 +659,23 @@ fn render_graph_tile(
     let x = align_to_chroma_grid((frame_w as f64 * 0.04) as i32);
     let y = align_to_chroma_grid((frame_h as f64 * 0.72) as i32);
 
-    let start_sec = (dive_sec - window_sec).max(0.0);
-    let end_sec = (start_sec + 1.0).max(dive_sec);
+    // The plot always spans the whole dive so far: it starts at elapsed zero
+    // and its right edge is "now". The box is a fixed fraction of the frame,
+    // so the seconds-per-pixel resolution drops as the dive gets longer --
+    // that is the intent, a profile that grows rather than a window that
+    // slides and loses the descent.
+    //
+    // The edge is snapped down to a whole second, the rate dive computers
+    // actually log at and the rate the info box counts at, so the plot gains
+    // its next second exactly when the displayed dive time does. It also
+    // makes the plan stable within a second: without it the horizontal scale
+    // creeps every frame and, across hundreds of points, a few always cross a
+    // rounding boundary -- enough to miss the cache on nearly every frame
+    // while changing nothing anyone can see.
+    let end_sec = dive_sec.floor().max(1.0);
 
-    let start_idx = times.partition_point(|&t| t < start_sec);
     let end_idx = times.partition_point(|&t| t <= end_sec);
-    let window = &samples[start_idx..end_idx];
+    let window = &samples[..end_idx];
     if window.is_empty() {
         return None;
     }
@@ -664,56 +691,82 @@ fn render_graph_tile(
         max_depth = min_depth + 1.0;
     }
 
-    let metrics = GraphMetrics::for_frame(frame_h);
+    let mut points: Vec<(i32, i32)> = Vec::new();
+    for sample in window {
+        let Some(depth) = sample.depth_m else { continue };
+        let t = sample.elapsed_sec;
+        if t < 0.0 || t > end_sec {
+            continue;
+        }
+        let tx = t / end_sec;
+        let ty = (depth - min_depth) / (max_depth - min_depth);
+        // Tile-local coordinates: the frame offset is applied by the composite.
+        let px = tx * (graph_w as f64 - 2.0) + 1.0;
+        let py = ty * (graph_h as f64 - 2.0) + 1.0;
+        let point = (px.round() as i32, py.round() as i32);
+        // A whole-dive plot puts thousands of samples into a box a few hundred
+        // pixels wide, so long runs of samples land on one pixel. Dropping the
+        // repeats bounds the segment count by the box size instead of the dive
+        // length, and it is also what keeps the plan stable frame to frame:
+        // late in a dive another 1/30 s moves no point, so the cache holds.
+        if points.last() == Some(&point) {
+            continue;
+        }
+        points.push(point);
+    }
 
+    Some(GraphPlan {
+        width: graph_w,
+        height: graph_h,
+        x,
+        y,
+        metrics: GraphMetrics::for_frame(frame_h),
+        points,
+        // min_depth (shallowest) plots at the top of the box, max_depth
+        // (deepest) at the bottom.
+        min_label: format!("{min_depth:.1}m"),
+        max_label: format!("{max_depth:.1}m"),
+    })
+}
+
+/// Renders a plan into its own tile.
+///
+/// The graph used to draw straight onto the frame. Rendering to a tile means
+/// all the per-pixel work happens on a buffer a few percent of the frame's
+/// size (better cache locality), and -- more importantly -- it leaves
+/// compositing as the single operation that has to know the frame's pixel
+/// format.
+fn render_graph_tile(plan: &GraphPlan) -> RgbaImage {
     // The translucent background is baked into the tile's alpha channel
     // instead of being blended against the frame up front, so the frame is
     // read exactly once, during the composite.
     let bg_alpha = (0.35_f32 * 255.0).round() as u8;
-    let mut tile = RgbaImage::from_pixel(graph_w, graph_h, Rgba([10, 10, 10, bg_alpha]));
+    let mut tile = RgbaImage::from_pixel(plan.width, plan.height, Rgba([10, 10, 10, bg_alpha]));
 
     draw_thick_hollow_rect(
         &mut tile,
         0,
         0,
-        graph_w,
-        graph_h,
+        plan.width,
+        plan.height,
         Rgba([90, 90, 90, 255]),
-        metrics.stroke,
+        plan.metrics.stroke,
     );
 
-    let mut points: Vec<(f32, f32)> = Vec::new();
-    for sample in window {
-        let Some(depth) = sample.depth_m else { continue };
-        let t = sample.elapsed_sec;
-        if t < start_sec || t > end_sec {
-            continue;
-        }
-        let tx = (t - start_sec) / (end_sec - start_sec);
-        let ty = (depth - min_depth) / (max_depth - min_depth);
-        // Tile-local coordinates: the frame offset is applied by the composite.
-        let px = tx * (graph_w as f64 - 2.0) + 1.0;
-        let py = ty * (graph_h as f64 - 2.0) + 1.0;
-        points.push((px as f32, py as f32));
-    }
-
-    for pair in points.windows(2) {
+    for pair in plan.points.windows(2) {
         draw_thick_line(
             &mut tile,
-            pair[0],
-            pair[1],
+            (pair[0].0 as f32, pair[0].1 as f32),
+            (pair[1].0 as f32, pair[1].1 as f32),
             Rgba([DEPTH_CURVE_GREY, DEPTH_CURVE_GREY, DEPTH_CURVE_GREY, 255]),
-            metrics.stroke,
+            plan.metrics.stroke,
         );
     }
 
-    let axis_scale = metrics.font;
+    let axis_scale = plan.metrics.font;
     let axis_font = font();
-    let label_inset = metrics.inset;
-    let max_label = format!("{max_depth:.1}m");
-    let min_label = format!("{min_depth:.1}m");
-    let (_, min_label_h) = text_size(axis_scale, axis_font, &min_label);
-    // min_depth (shallowest) plots at the top of the box, max_depth (deepest) at the bottom.
+    let label_inset = plan.metrics.inset;
+    let (_, min_label_h) = text_size(axis_scale, axis_font, &plan.min_label);
     draw_text_mut(
         &mut tile,
         Rgba([200, 200, 200, 255]),
@@ -721,26 +774,57 @@ fn render_graph_tile(
         label_inset / 2,
         axis_scale,
         axis_font,
-        &min_label,
+        &plan.min_label,
     );
     draw_text_mut(
         &mut tile,
         Rgba([200, 200, 200, 255]),
         label_inset,
-        graph_h as i32 - min_label_h as i32 - label_inset / 2,
+        plan.height as i32 - min_label_h as i32 - label_inset / 2,
         axis_scale,
         axis_font,
-        &max_label,
+        &plan.max_label,
     );
 
-    Some(PositionedTile { image: tile, x, y })
+    tile
+}
+
+/// Returns the cached graph tile, re-rendering it only when the plan changed.
+///
+/// The plan only changes when the plot reaches a new whole second, so at
+/// 30 fps 29 frames out of 30 pay a plan comparison and a blend instead of a
+/// re-render and a YUV conversion -- the same bargain `cached_overlay_tile`
+/// makes for the info box, whose text turns over on the same cadence.
+fn cached_graph_tile<'a>(
+    cache: &'a mut OverlayCache,
+    samples: &[DiveSample],
+    times: &[f64],
+    dive_sec: f64,
+    w: u32,
+    h: u32,
+) -> Option<&'a mut CachedGraph> {
+    let plan = plan_graph(samples, times, dive_sec, w, h)?;
+
+    let needs_render = !matches!(&cache.graph, Some(cached) if cached.plan == plan);
+    if needs_render {
+        let image = render_graph_tile(&plan);
+        cache.graph = Some(CachedGraph { plan, image, yuv: None });
+    }
+    cache.graph.as_mut()
 }
 
 /// Draws the depth profile onto a packed-RGB frame (the GUI's sync preview).
-pub fn draw_depth_graph(img: &mut RgbImage, samples: &[DiveSample], times: &[f64], dive_sec: f64, window_sec: f64) {
+pub fn draw_depth_graph(
+    img: &mut RgbImage,
+    samples: &[DiveSample],
+    times: &[f64],
+    dive_sec: f64,
+    cache: &mut OverlayCache,
+) {
     let (w, h) = img.dimensions();
-    if let Some(tile) = render_graph_tile(samples, times, dive_sec, window_sec, w, h) {
-        composite_tile(img, &tile.image, tile.x, tile.y);
+    if let Some(cached) = cached_graph_tile(cache, samples, times, dive_sec, w, h) {
+        let (x, y) = (cached.plan.x, cached.plan.y);
+        composite_tile(img, &cached.image, x, y);
     }
 }
 
@@ -750,14 +834,20 @@ pub fn draw_depth_graph_yuv(
     samples: &[DiveSample],
     times: &[f64],
     dive_sec: f64,
-    window_sec: f64,
     range: ColorRange,
+    cache: &mut OverlayCache,
 ) {
     let (w, h) = (frame.width(), frame.height());
-    if let Some(tile) = render_graph_tile(samples, times, dive_sec, window_sec, w, h) {
-        let yuv = YuvTile::from_rgba(&tile.image, range);
-        composite_tile_yuv(frame, &yuv, tile.x, tile.y);
+    let Some(cached) = cached_graph_tile(cache, samples, times, dive_sec, w, h) else {
+        return;
+    };
+
+    let stale = !matches!(&cached.yuv, Some((cached_range, _)) if *cached_range == range);
+    if stale {
+        cached.yuv = Some((range, YuvTile::from_rgba(&cached.image, range)));
     }
+    let (_, tile) = cached.yuv.as_ref().expect("just populated");
+    composite_tile_yuv(frame, tile, cached.plan.x, cached.plan.y);
 }
 
 #[cfg(test)]
@@ -886,7 +976,7 @@ mod tests {
         let samples = vec![sample(0.0, 1.0), sample(10.0, 5.0), sample(20.0, 3.0)];
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
 
-        draw_depth_graph_yuv(&mut yuv, &samples, &times, 15.0, 600.0, range);
+        draw_depth_graph_yuv(&mut yuv, &samples, &times, 15.0, range, &mut OverlayCache::new());
 
         let (cw, ch) = yuv.chroma_dimensions();
         let raw = yuv.as_raw();
@@ -1055,7 +1145,81 @@ mod tests {
         let mut img = RgbImage::new(320, 240);
         let samples = vec![sample(0.0, 1.0), sample(5.0, 3.0), sample(10.0, 2.0)];
         let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
-        draw_depth_graph(&mut img, &samples, &times, 10.0, 600.0);
+        draw_depth_graph(&mut img, &samples, &times, 10.0, &mut OverlayCache::new());
+    }
+
+    /// The plot spans the whole dive so far, so a sample from the first
+    /// minute still shapes the picture an hour in -- the old trailing
+    /// 600 s window had scrolled the descent off the left edge by then.
+    #[test]
+    fn depth_graph_spans_the_whole_dive_not_a_trailing_window() {
+        let tail: Vec<DiveSample> = (0..60).map(|i| sample(600.0 + i as f64 * 50.0, 5.0)).collect();
+
+        let mut deep = vec![sample(30.0, 40.0)];
+        deep.extend(tail.iter().cloned());
+        let mut shallow = vec![sample(30.0, 5.5)];
+        shallow.extend(tail.iter().cloned());
+
+        let times: Vec<f64> = deep.iter().map(|s| s.elapsed_sec).collect();
+        let with_spike = render_graph_tile(&plan_graph(&deep, &times, 3600.0, 320, 240).unwrap());
+        let without_spike = render_graph_tile(&plan_graph(&shallow, &times, 3600.0, 320, 240).unwrap());
+
+        assert_ne!(
+            with_spike.as_raw(),
+            without_spike.as_raw(),
+            "a sample 30 s into the dive must still affect the plot at 60 minutes"
+        );
+    }
+
+    /// The graph is the expensive tile to build, and late in a dive its
+    /// picture is identical for many frames in a row, so the cache has to
+    /// survive the frame-to-frame advance in `dive_sec` and still notice a
+    /// step big enough to move the plot.
+    #[test]
+    fn depth_graph_reuses_its_tile_until_the_plotted_picture_changes() {
+        let samples: Vec<DiveSample> = (0..2400)
+            .map(|i| sample(i as f64, 10.0 + (i as f64 / 100.0).sin() * 5.0))
+            .collect();
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let mut img = RgbImage::new(1920, 1080);
+        let mut cache = OverlayCache::new();
+
+        draw_depth_graph(&mut img, &samples, &times, 2000.0, &mut cache);
+        let first = cache.graph.as_ref().unwrap().image.as_raw().as_ptr();
+
+        // One frame later at 30 fps: still the same whole second, so the plan
+        // is identical and nothing may be re-rendered.
+        draw_depth_graph(&mut img, &samples, &times, 2000.0 + 1.0 / 30.0, &mut cache);
+        let next_frame = cache.graph.as_ref().unwrap().image.as_raw().as_ptr();
+        assert_eq!(first, next_frame, "an unchanged plot must reuse the cached tile");
+
+        // Far enough along that new samples have entered the plot.
+        draw_depth_graph(&mut img, &samples, &times, 2300.0, &mut cache);
+        let later = cache.graph.as_ref().unwrap().image.as_raw().as_ptr();
+        assert_ne!(first, later, "a changed plot must re-render");
+    }
+
+    /// The YUV conversion is the other half of the graph's per-frame cost,
+    /// and it is only worth caching the tile if the conversion rides along.
+    #[test]
+    fn depth_graph_reuses_its_yuv_conversion_with_the_tile() {
+        let range = ColorRange::Full;
+        let samples: Vec<DiveSample> = (0..2400).map(|i| sample(i as f64, 10.0)).collect();
+        let times: Vec<f64> = samples.iter().map(|s| s.elapsed_sec).collect();
+        let (_, mut yuv) = matching_frames(320, 240, 128, range);
+        let mut cache = OverlayCache::new();
+
+        draw_depth_graph_yuv(&mut yuv, &samples, &times, 2000.0, range, &mut cache);
+        let first = cache.graph.as_ref().unwrap().yuv.as_ref().unwrap().1.luma.as_ptr();
+
+        draw_depth_graph_yuv(&mut yuv, &samples, &times, 2000.0 + 1.0 / 30.0, range, &mut cache);
+        let again = cache.graph.as_ref().unwrap().yuv.as_ref().unwrap().1.luma.as_ptr();
+        assert_eq!(first, again, "an unchanged tile must not be reconverted");
+
+        // A different colour range must not reuse the old conversion.
+        draw_depth_graph_yuv(&mut yuv, &samples, &times, 2000.0, ColorRange::Limited, &mut cache);
+        let converted = cache.graph.as_ref().unwrap().yuv.as_ref().unwrap();
+        assert_eq!(converted.0, ColorRange::Limited);
     }
 
     /// 1080p is the resolution the overlay's sizes were hand-tuned at, so
