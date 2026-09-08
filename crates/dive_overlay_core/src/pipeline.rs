@@ -11,8 +11,9 @@ use image::RgbImage;
 use crate::error::CoreError;
 use crate::ffprobe::probe_video;
 use crate::model::{ClipJob, DiveSample, Field};
-use crate::overlay::{build_overlay_lines, draw_depth_graph, draw_overlay, OverlayCache};
+use crate::overlay::{build_overlay_lines, draw_depth_graph_yuv, draw_overlay_yuv, OverlayCache};
 use crate::subtitle::build_srt;
+use crate::yuv::{ColorRange, Yuv420Frame};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -351,15 +352,19 @@ impl OutputMode {
 /// rather than a blurry upscale.
 ///
 /// The scale is applied in the decoder (see `spawn_decoder`), not the
-/// encoder, and that placement is the whole point of the feature. Measured
-/// on the 5.3K test clip, the burned-in path spends ~63% of its time in
-/// libx264, ~19% shuttling rgb24 frames through the two pipes, ~13% in the
-/// HEVC decode and only ~6% drawing. Scaling before the pipe shrinks the
-/// encode, the pipe traffic (47.6 MB -> 28.3 MB per frame at 4K) and the
-/// draw area together; scaling in the encoder would shrink only the encode.
-/// It also drops the frame size below the hardware encoders' per-axis
-/// limits -- `resolve_encoder` probes at the *output* size, so a 5.3K job
-/// that could only ever use software silently gains the AMF path at 4K.
+/// encoder, and that placement is the whole point of the feature: it shrinks
+/// the encode, the pipe traffic (23.8 MB -> 12.4 MB per planar frame going
+/// from 5.3K to 4K) and the overlay's draw area all at once, where an
+/// encoder-side filter would shrink only the encode.
+///
+/// It also drops the frame size below the hardware encoders' per-axis limits
+/// -- `resolve_encoder` probes at the *output* size, so a 5.3K job that could
+/// only ever use software silently gains the AMF path at 4K. Measured on the
+/// test clip, that is the difference between 4.52 and 14.60 fps.
+///
+/// Note 4:2:0 has no way to represent an odd width or height; `process_clip`
+/// rejects such a frame size rather than letting the raw stream go out of
+/// step with the buffer sized for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputResolution {
     Original,
@@ -551,8 +556,8 @@ struct DecodeProcess {
     stderr: JoinHandle<String>,
 }
 
-/// Spawns an ffmpeg process that decodes `video_path` to a raw rgb24 stream
-/// on stdout at a constant `fps`. Constant-frame-rate output is essential:
+/// Spawns an ffmpeg process that decodes `video_path` to a raw planar 4:2:0
+/// stream on stdout at a constant `fps`. Constant-frame-rate output is essential:
 /// the pipeline derives each frame's timestamp as `frame_idx / fps` and the
 /// encoder is told the same `-r`, so with `passthrough` a variable-frame-rate
 /// source (typical phone footage) would emit fewer/more frames than
@@ -562,18 +567,35 @@ struct DecodeProcess {
 /// carries real frame data.
 ///
 /// `scale_to` downsizes the picture here, in the decoder, rather than in the
-/// encoder: every later stage (the rgb24 pipe, the overlay drawing, the
-/// encode) then works on the smaller frame. The target is computed by
+/// encoder: every later stage (the pipe, the overlay drawing, the encode)
+/// then works on the smaller frame. The target is computed by
 /// `OutputResolution::target_dimensions` and passed in explicitly rather
 /// than expressed as an ffmpeg filter expression, so this process and
 /// ffmpeg cannot disagree about the frame size -- the read buffer in
 /// `process_clip` is sized from the same pair of numbers.
-fn spawn_decoder(video_path: &Path, fps: f64, scale_to: Option<(u32, u32)>) -> Result<DecodeProcess, CoreError> {
+///
+/// Frames cross the pipe as planar 4:2:0, in the source's *own* colour
+/// range (`range.raw_pixel_format()`), which is what video codecs decode to
+/// natively. Asking for the native format means ffmpeg hands the planes over
+/// with no swscale pass at all. The previous `rgb24` cost two full
+/// conversions per frame -- out of the format both ends already spoke and
+/// straight back into it -- twice the bytes on both pipes, and a lossy
+/// chroma upsample/re-subsample round-trip on every single frame.
+fn spawn_decoder(
+    video_path: &Path,
+    fps: f64,
+    scale_to: Option<(u32, u32)>,
+    range: ColorRange,
+) -> Result<DecodeProcess, CoreError> {
     let fps_arg = format!("{fps}");
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-nostdin", "-v", "error", "-i"])
-        .arg(video_path)
-        .args(["-an", "-f", "rawvideo", "-pix_fmt", "rgb24"]);
+    cmd.args(["-nostdin", "-v", "error", "-i"]).arg(video_path).args([
+        "-an",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        range.raw_pixel_format(),
+    ]);
     if let Some((width, height)) = scale_to {
         cmd.args(["-vf", &format!("scale={width}:{height}")]);
     }
@@ -595,9 +617,12 @@ fn spawn_decoder(video_path: &Path, fps: f64, scale_to: Option<(u32, u32)>) -> R
 ///
 /// Windows fails `WriteFile` on a pipe with `ERROR_NO_SYSTEM_RESOURCES`
 /// (os error 1450) when one write is large enough to exhaust the kernel's
-/// non-paged pool -- a 5.3K rgb24 frame is ~36 MB, and a full-length dive
-/// eventually trips it even though the first frames go through. Splitting
-/// each frame into small writes keeps every request well under the limit.
+/// non-paged pool -- a full 5.3K frame is tens of megabytes (~48 MB back when
+/// the pipe carried rgb24, ~24 MB now that it carries planar 4:2:0), and a
+/// full-length dive eventually trips it even though the first frames go
+/// through. Splitting each frame into small writes keeps every request well
+/// under the limit. Halving the frame size halved the number of chunks too,
+/// but the hazard is unchanged, so the retry stays.
 const PIPE_CHUNK: usize = 256 * 1024;
 
 /// Writes one raw frame to the encoder in `PIPE_CHUNK`-sized pieces,
@@ -633,7 +658,7 @@ struct EncodeProcess {
     info: EncoderInfo,
 }
 
-/// Spawns an ffmpeg process that reads raw rgb24 frames on stdin, muxes in
+/// Spawns an ffmpeg process that reads raw planar 4:2:0 frames on stdin, muxes in
 /// the original file's audio track (mapped optionally via `1:a:0?` so
 /// audio-less clips don't fail the job), and writes the final mp4. `-y`
 /// (not `-nostdin`) belongs here since stdin carries real data -- `-y`
@@ -649,6 +674,7 @@ fn spawn_encoder(
     codec: Codec,
     preset: Preset,
     hw_accel: bool,
+    range: ColorRange,
 ) -> Result<EncodeProcess, CoreError> {
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -660,14 +686,26 @@ fn spawn_encoder(
     let fps_arg = format!("{fps}");
     let (encoder_name, pix_fmt, extra_args, info) = resolve_encoder(codec, preset, hw_accel, width, height);
 
+    // The input pix_fmt matches what the decoder emits; the output one
+    // (further down, from `resolve_encoder`) is unchanged, so full-range
+    // sources still get the same single range conversion at encode time that
+    // they always did -- via rgb24 before, directly now.
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24"])
-        .args(["-s", &size_arg, "-r", &fps_arg, "-i", "pipe:0"])
-        .arg("-i")
-        .arg(original_input)
-        .args(["-map", "0:v:0", "-map", "1:a:0?"])
-        .args(["-c:v", encoder_name])
-        .args(&extra_args);
+    cmd.args([
+        "-y",
+        "-v",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        range.raw_pixel_format(),
+    ])
+    .args(["-s", &size_arg, "-r", &fps_arg, "-i", "pipe:0"])
+    .arg("-i")
+    .arg(original_input)
+    .args(["-map", "0:v:0", "-map", "1:a:0?"])
+    .args(["-c:v", encoder_name])
+    .args(&extra_args);
     let mut child = cmd
         .args(["-pix_fmt", pix_fmt])
         .args(["-c:a", "aac", "-b:a", "192k", "-shortest"])
@@ -728,7 +766,21 @@ pub fn process_clip(
     let (out_width, out_height) = options.resolution.target_dimensions(info.width, info.height);
     let scale_to = ((out_width, out_height) != (info.width, info.height)).then_some((out_width, out_height));
 
-    let mut decoder = spawn_decoder(&job.video_path, info.fps, scale_to)?;
+    // 4:2:0 stores one chroma sample per 2x2 luma block, so it has no way to
+    // represent an odd width or height. `target_dimensions` guarantees even
+    // sizes for the fixed rungs, but `Original` passes the source through --
+    // and an odd-sized source would otherwise desynchronize the raw stream
+    // rather than fail, so reject it here with a message that says why.
+    if !out_width.is_multiple_of(2) || !out_height.is_multiple_of(2) {
+        return Err(CoreError::Ffmpeg(format!(
+            "Frame size {out_width}x{out_height} has an odd dimension, which planar 4:2:0 video cannot represent. \
+             Choose an explicit output resolution (e.g. --resolution 1080p) to scale it to an even size."
+        )));
+    }
+
+    let range = ColorRange::from_full_range_flag(info.full_range);
+
+    let mut decoder = spawn_decoder(&job.video_path, info.fps, scale_to, range)?;
     let mut encoder = spawn_encoder(
         &job.output_path,
         &job.video_path,
@@ -738,10 +790,11 @@ pub fn process_clip(
         options.codec,
         options.preset,
         options.hw_accel,
+        range,
     )?;
     on_encoder(&encoder.info);
 
-    let frame_size = out_width as usize * out_height as usize * 3;
+    let frame_size = Yuv420Frame::buffer_size(out_width, out_height);
     let total_estimate = info.estimated_frames.unwrap_or(0);
 
     let mut buf = vec![0u8; frame_size];
@@ -766,16 +819,16 @@ pub fn process_clip(
             }
         }
 
-        let mut img = RgbImage::from_raw(out_width, out_height, std::mem::take(&mut buf))
+        let mut img = Yuv420Frame::from_raw(out_width, out_height, std::mem::take(&mut buf))
             .ok_or_else(|| CoreError::Ffmpeg("Invalid frame size".to_string()))?;
 
         let video_sec = frame_idx as f64 / info.fps;
         let dive_sec = job.csv_sync_sec + (video_sec - job.video_sync_sec);
 
         let lines = build_overlay_lines(&options.fields, samples, times, dive_sec, options.interpolate);
-        draw_overlay(&mut img, &lines, &mut overlay_cache);
+        draw_overlay_yuv(&mut img, &lines, &mut overlay_cache, range);
         if options.show_graph {
-            draw_depth_graph(&mut img, samples, times, dive_sec, 600.0);
+            draw_depth_graph_yuv(&mut img, samples, times, dive_sec, 600.0, range);
         }
 
         if let Some(stdin) = encoder.stdin.as_mut() {
@@ -1276,7 +1329,7 @@ mod tests {
     /// End-to-end proof that the decoder-side scale actually lands: the
     /// frame buffer, the `-s` given to the encoder and ffmpeg's own filter
     /// all have to agree, and a mismatch would either tear the picture or
-    /// desynchronize the rgb24 stream rather than fail loudly.
+    /// desynchronize the raw stream rather than fail loudly.
     #[test]
     fn downscales_the_output_to_the_selected_resolution() {
         let dir = make_test_dir("resolution_downscale");

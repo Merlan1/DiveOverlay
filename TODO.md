@@ -7,28 +7,35 @@
 - [ ] Replace linear interpolation (`--interpolate` / GUI checkbox) with a Fourier-transform-based reconstruction for smoother inter-sample estimates. Note: dive-computer samples are sparse and irregularly spaced, so a spline/cubic fit may suit this data better than FFT-based reconstruction — worth evaluating both.
 - [x] Add an output-resolution toggle (`--resolution` / GUI dropdown): original (default), 4k, 1080p, 720p. Downscales only, preserves aspect ratio, applied in the decoder so the pipe, the drawing and the encode all shrink together.
 
-- [ ] **Known bottleneck: the rgb24 round-trip between the decode and encode
-  subprocesses.** Every frame crosses two pipes uncompressed — 47.6 MB at
-  5312x2988, 28.3 MB at 4K — and `process_clip` serializes read → draw →
-  write on one thread. Measured on `test_clip0.MP4` (210 frames, 12 cores):
+- [x] Replace the rgb24 pipe with planar YUV 4:2:0. Frames now cross both
+  pipes in the format the codecs already speak, halving the bytes (47.6 MB ->
+  23.8 MB per frame at 5.3K, 24.9 MB -> 12.4 MB at 4K) and removing both
+  swscale passes and the lossy `yuv420p -> rgb24 -> yuv420p` chroma
+  round-trip. Every overlay element is rendered to an RGBA tile, so only
+  `composite_tile`/`composite_tile_yuv` know about pixel layout; the depth
+  curve became light grey because a saturated thin line subsamples badly at
+  half-resolution chroma.
 
-  | Stage | 5.3K, libx264 veryfast | 4K, h264_amf |
+  Measured on `test_clip0.MP4` (210 frames), before -> after:
+
+  | Configuration | before | after |
   |---|---|---|
-  | encode | 63% | small (21.9 fps in-process) |
-  | rgb24 convert + the two pipes | 19% | **~45%, the largest single cost** |
-  | HEVC decode | 13% | (decode+scale ceiling: 27.4 fps) |
-  | overlay drawing | 6% | 6% |
+  | original + veryfast | 4.16 fps | 4.52 fps |
+  | `--resolution 4k --hw-accel` | 12.70 fps | **14.60 fps** |
+  | `--resolution 1080p --hw-accel` | 21.80 fps | 21.87 fps |
 
-  Whole-program: 4.16 fps before, 12.70 fps at `--resolution 4k --hw-accel`,
-  21.80 at 1080p, 25.63 at 720p. Once the encoder is hardware and the frame
-  is 4K, the pipe is what's left. Two candidate fixes, neither started:
-  - Move the draw to a worker thread with a small frame queue, so decode and
-    draw overlap the encode instead of serializing (~19% ceiling).
-  - Stop paying for rgb24. yuv420p would halve the bytes on both pipes, but
-    `imageproc`/`ab_glyph` draw into packed RGB, so this needs either a
-    planar-YUV text blitter or drawing only inside the overlay's bounding box.
+  +15% where it mattered (4K with a hardware encoder). The 1080p row is flat
+  because the bottleneck there has moved to the HEVC decode.
 
-  Do not chase the drawing code: it is 6% of runtime, and `--show-graph`
-  costs 3%. Benchmark on `test_clip0.MP4`, never on `lavfi` sources — x264's
-  speed collapses on real content while fixed-function encoders barely move,
-  so synthetic clips rank the encoders backwards.
+- [ ] **Remaining bottleneck: the frame loop is single-threaded.** `process_clip`
+  serializes read -> draw -> write on one thread while 12 cores sit partly
+  idle. Moving the overlay draw to a worker with a small frame queue would let
+  decode and draw overlap the encode. Ceiling is modest -- drawing is ~6% of
+  runtime and decode ~13% -- so this is worth doing only after measuring
+  again, and only for the hardware-encoder configurations where the encode no
+  longer dominates.
+
+  Do not chase the drawing code on its own: it is ~6% of runtime, and
+  `--show-graph` costs ~1%. Benchmark on `test_clip0.MP4`, never on `lavfi`
+  sources -- x264's speed collapses on real content while fixed-function
+  encoders barely move, so synthetic clips rank the encoders backwards.

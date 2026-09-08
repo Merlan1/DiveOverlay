@@ -19,6 +19,8 @@ struct StreamInfo {
     codec_type: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    pix_fmt: Option<String>,
+    color_range: Option<String>,
     r_frame_rate: Option<String>,
     avg_frame_rate: Option<String>,
     nb_frames: Option<String>,
@@ -85,6 +87,19 @@ pub struct VideoInfo {
     /// first) -- used for sizing subtitle-cue generation, where we need the
     /// actual runtime rather than a frame-count estimate.
     pub duration_sec: Option<f64>,
+    /// Whether the decoder's luma/chroma samples span the full 0..255 range
+    /// rather than the broadcast-legal 16..235 / 16..240.
+    ///
+    /// This is *not* cosmetic metadata: the overlay is drawn straight into
+    /// the decoded planes, so its black and white points have to match the
+    /// picture's. Writing Y=255 for white into limited-range footage clips
+    /// into illegal super-white, and writing Y=235 into full-range footage
+    /// gives visibly dull, grey "white" text. GoPro records full range
+    /// (`yuvj420p` / `color_range=pc`), so both cases occur in practice.
+    ///
+    /// Read from `color_range`, falling back to the deprecated-but-still-
+    /// emitted `yuvj*` pixel format names, which mean the same thing.
+    pub full_range: bool,
     /// Whether the file carries at least one audio stream. Merging needs it:
     /// clips with and without audio cannot be joined by a stream copy, and
     /// the re-encode path has to synthesize silence for the silent ones.
@@ -253,10 +268,17 @@ fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
 
     let has_audio = parsed.streams.iter().any(|s| s.codec_type.as_deref() == Some("audio"));
 
+    let full_range = video_stream.color_range.as_deref() == Some("pc")
+        || video_stream
+            .pix_fmt
+            .as_deref()
+            .is_some_and(|fmt| fmt.starts_with("yuvj"));
+
     Ok(VideoInfo {
         width,
         height,
         rotation_deg,
+        full_range,
         fps,
         estimated_frames,
         creation_time,

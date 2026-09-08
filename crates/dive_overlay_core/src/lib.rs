@@ -8,6 +8,7 @@ pub mod overlay;
 pub mod pipeline;
 pub mod subtitle;
 pub mod sync;
+pub mod yuv;
 
 pub use error::{CoreError, CoreResult};
 pub use model::{ClipJob, DiveSample, Field};
