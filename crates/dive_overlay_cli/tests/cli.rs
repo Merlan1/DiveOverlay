@@ -101,10 +101,8 @@ fn auto_sync_end_to_end() {
     // Timecodes 5 minutes apart but creation_times 9 minutes apart, so the
     // derived sync below only comes out at 5:00 if auto-sync read the
     // timecode -- which is what it must do when every clip has one.
-    let clip1 =
-        synth_clip_with_timecode(&dir, "c1.mp4", 1, 5, "2025-07-05T08:00:00Z", "10:00:00:00");
-    let clip2 =
-        synth_clip_with_timecode(&dir, "c2.mp4", 1, 5, "2025-07-05T08:09:00Z", "10:05:00:00");
+    let clip1 = synth_clip_with_timecode(&dir, "c1.mp4", 1, 5, "2025-07-05T08:00:00Z", "10:00:00:00");
+    let clip2 = synth_clip_with_timecode(&dir, "c2.mp4", 1, 5, "2025-07-05T08:09:00Z", "10:05:00:00");
     // An elapsed-time-only CSV: auto-sync no longer needs date/clock columns.
     let csv = write_csv(&dir);
 
@@ -122,10 +120,7 @@ fn auto_sync_end_to_end() {
         .args(["--base-video-sync-sec", "0"]);
     let assert = cmd.assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
-    assert!(
-        stdout.contains("placed by start timecode"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("placed by start timecode"), "stdout: {stdout}");
     // Second clip started 5 minutes after the base, whose own sync is 0:00.
     assert!(stdout.contains("c2.mp4 -> CSV 05:00"), "stdout: {stdout}");
 

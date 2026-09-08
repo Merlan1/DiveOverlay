@@ -27,9 +27,9 @@ pub fn parse_clip_spec(spec: &str) -> Result<ClipJob, CoreError> {
     }
 
     let video_path = PathBuf::from(parts[0]);
-    let video_sync_sec: f64 = parts[1].parse().map_err(|_| {
-        CoreError::InvalidClipSpec(format!("Invalid video_sync_sec in --clip: {}", parts[1]))
-    })?;
+    let video_sync_sec: f64 = parts[1]
+        .parse()
+        .map_err(|_| CoreError::InvalidClipSpec(format!("Invalid video_sync_sec in --clip: {}", parts[1])))?;
     let csv_sync_sec = parse_duration_to_seconds(parts[2])?;
     let output_path = if parts.len() == 4 {
         PathBuf::from(parts[3])
@@ -47,7 +47,12 @@ pub fn parse_clip_spec(spec: &str) -> Result<ClipJob, CoreError> {
 }
 
 fn parse_naive_utc(text: &str) -> Result<DateTime<Utc>, CoreError> {
-    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(text, fmt) {
             return Ok(DateTime::from_naive_utc_and_offset(naive, Utc));
         }
@@ -173,15 +178,10 @@ pub fn compute_auto_sync(
     let base_index = jobs
         .iter()
         .position(|j| {
-            let resolved = j
-                .video_path
-                .canonicalize()
-                .unwrap_or_else(|_| j.video_path.clone());
+            let resolved = j.video_path.canonicalize().unwrap_or_else(|_| j.video_path.clone());
             resolved == base_clip_resolved
         })
-        .ok_or_else(|| {
-            CoreError::Other("--base-clip must be one of the --clip paths".to_string())
-        })?;
+        .ok_or_else(|| CoreError::Other("--base-clip must be one of the --clip paths".to_string()))?;
 
     let infos: Vec<VideoInfo> = jobs
         .iter()
@@ -207,9 +207,7 @@ pub fn compute_auto_sync(
         let info = &infos[idx];
         let delta_sec = match source {
             // `source` is Timecode only when every clip has one.
-            ClipStartSource::Timecode => {
-                timecode_delta(base_timecode.unwrap(), info.timecode_sec.unwrap())
-            }
+            ClipStartSource::Timecode => timecode_delta(base_timecode.unwrap(), info.timecode_sec.unwrap()),
             ClipStartSource::CreationTime => {
                 let start = info.creation_time.ok_or_else(|| {
                     CoreError::Ffprobe(format!(
@@ -279,14 +277,8 @@ mod tests {
     fn synth_clip(dir: &Path, name: &str, creation_time: &str, timecode: Option<&str>) -> PathBuf {
         let path = dir.join(name);
         let mut cmd = Command::new("ffmpeg");
-        cmd.args([
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x64:rate=30:duration=2",
-        ])
-        .args(["-metadata", &format!("creation_time={creation_time}")]);
+        cmd.args(["-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=30:duration=2"])
+            .args(["-metadata", &format!("creation_time={creation_time}")]);
         if let Some(tc) = timecode {
             cmd.args(["-timecode", tc]);
         }
@@ -349,18 +341,8 @@ mod tests {
     #[test]
     fn auto_sync_offsets_from_the_base_clips_own_csv_sync() {
         let dir = make_dir("auto_sync_timecode");
-        let base = synth_clip(
-            &dir,
-            "base.mp4",
-            "2025-07-05T10:00:00Z",
-            Some("10:00:00:00"),
-        );
-        let second = synth_clip(
-            &dir,
-            "second.mp4",
-            "2025-07-05T10:05:00Z",
-            Some("10:05:00:00"),
-        );
+        let base = synth_clip(&dir, "base.mp4", "2025-07-05T10:00:00Z", Some("10:00:00:00"));
+        let second = synth_clip(&dir, "second.mp4", "2025-07-05T10:05:00Z", Some("10:05:00:00"));
 
         let mut jobs = vec![job(&base, 120.0), job(&second, 0.0)];
         let params = AutoSyncParams {
@@ -372,11 +354,7 @@ mod tests {
         let report = compute_auto_sync(&mut jobs, &dive_times, &params).unwrap();
 
         assert_eq!(report.source, ClipStartSource::Timecode);
-        assert!(
-            report.warnings.is_empty(),
-            "unexpected warnings: {:?}",
-            report.warnings
-        );
+        assert!(report.warnings.is_empty(), "unexpected warnings: {:?}", report.warnings);
         // The base clip keeps the sync point it was given by hand...
         assert!((jobs[0].csv_sync_sec - 120.0).abs() < 0.1);
         // ...and the second, recorded 300 s later, is offset by exactly that.
@@ -393,12 +371,7 @@ mod tests {
         // a camera whose RTC and UTC clock disagree. Mixing the two sources
         // would place the second clip 2 h away; using creation_time for both
         // keeps it at +300 s.
-        let base = synth_clip(
-            &dir,
-            "base.mp4",
-            "2025-07-05T10:00:00Z",
-            Some("12:00:00:00"),
-        );
+        let base = synth_clip(&dir, "base.mp4", "2025-07-05T10:00:00Z", Some("12:00:00:00"));
         let second = synth_clip(&dir, "second.mp4", "2025-07-05T10:05:00Z", None);
 
         let mut jobs = vec![job(&base, 120.0), job(&second, 0.0)];
@@ -415,19 +388,9 @@ mod tests {
     #[test]
     fn auto_sync_warns_when_a_clip_lands_outside_the_dive() {
         let dir = make_dir("auto_sync_wrong_dive");
-        let base = synth_clip(
-            &dir,
-            "base.mp4",
-            "2025-07-05T10:00:00Z",
-            Some("10:00:00:00"),
-        );
+        let base = synth_clip(&dir, "base.mp4", "2025-07-05T10:00:00Z", Some("10:00:00:00"));
         // Four hours later: a different dive that happened to be selected.
-        let other = synth_clip(
-            &dir,
-            "other.mp4",
-            "2025-07-05T14:00:00Z",
-            Some("14:00:00:00"),
-        );
+        let other = synth_clip(&dir, "other.mp4", "2025-07-05T14:00:00Z", Some("14:00:00:00"));
 
         let mut jobs = vec![job(&base, 0.0), job(&other, 0.0)];
         let params = AutoSyncParams {
@@ -458,9 +421,6 @@ mod tests {
             base_video_sync_sec: 0.0,
         };
         let err = compute_auto_sync(&mut jobs, &[], &params).unwrap_err();
-        assert!(
-            err.to_string().contains("must be one of"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("must be one of"), "unexpected error: {err}");
     }
 }

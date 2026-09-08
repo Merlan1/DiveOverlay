@@ -27,8 +27,8 @@ use crate::error::CoreError;
 use crate::ffprobe::probe_video;
 use crate::model::ClipJob;
 use crate::pipeline::{
-    ensure_output_differs_from_input, ffmpeg_failure, finish_stderr, resolve_encoder, spawn_stderr_capture,
-    OutputMode, ProcessingOptions,
+    ensure_output_differs_from_input, ffmpeg_failure, finish_stderr, resolve_encoder, spawn_stderr_capture, OutputMode,
+    ProcessingOptions,
 };
 use crate::subtitle::{concat_srt, SrtPart};
 
@@ -257,7 +257,9 @@ fn write_concat_list(inputs: &[PathBuf], list_path: &Path) -> Result<(), CoreErr
         let absolute = if input.is_absolute() {
             input.clone()
         } else {
-            std::env::current_dir().map(|dir| dir.join(input)).unwrap_or_else(|_| input.clone())
+            std::env::current_dir()
+                .map(|dir| dir.join(input))
+                .unwrap_or_else(|_| input.clone())
         };
         // Forward slashes keep Windows paths from being read as escapes.
         let escaped = absolute.to_string_lossy().replace('\\', "/").replace('\'', "'\\''");
@@ -306,7 +308,9 @@ fn concat_reencode(
     let width = target.width & !1;
     let height = target.height & !1;
     if width == 0 || height == 0 {
-        return Err(CoreError::Ffprobe("Could not determine a frame size to merge into".to_string()));
+        return Err(CoreError::Ffprobe(
+            "Could not determine a frame size to merge into".to_string(),
+        ));
     }
     let fps = parts.iter().map(|p| p.fps).fold(0.0f64, f64::max);
     let with_audio = parts.iter().any(|p| p.has_audio);
@@ -450,7 +454,9 @@ fn spawn_progress_reader(stdout: ChildStdout) -> Receiver<f64> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let Some((key, value)) = line.split_once('=') else { continue };
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
             // `out_time_us` is microseconds; `out_time_ms` is ffmpeg's
             // misnamed twin of it (also microseconds), taken as a fallback
             // for builds that only emit the older key.
@@ -552,7 +558,9 @@ mod tests {
             .arg(&srt)
             .args(["-map", "0:v", "-map", "1:a", "-map", "2:0"])
             .args(["-timecode", "01:00:00:00"])
-            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-c:s", "mov_text"])
+            .args([
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-c:s", "mov_text",
+            ])
             .arg(&path)
             .status()
             .unwrap();
@@ -660,13 +668,23 @@ mod tests {
         let output = dir.join("merged.mp4");
 
         let stop = Arc::new(AtomicBool::new(false));
-        let finished =
-            merge_clips(&[a.clone(), b.clone()], &output, OutputMode::Overlay, &default_options(), &stop, |_, _| {}).unwrap();
+        let finished = merge_clips(
+            &[a.clone(), b.clone()],
+            &output,
+            OutputMode::Overlay,
+            &default_options(),
+            &stop,
+            |_, _| {},
+        )
+        .unwrap();
 
         assert!(finished);
         let merged = duration_of(&output);
         let expected = duration_of(&a) + duration_of(&b);
-        assert!((merged - expected).abs() < 0.35, "merged {merged}s vs expected {expected}s");
+        assert!(
+            (merged - expected).abs() < 0.35,
+            "merged {merged}s vs expected {expected}s"
+        );
         assert!(probe_video(&output).unwrap().has_audio);
         // The playlist is scratch, not a leftover for the user to find.
         assert!(!output.with_extension("concat.txt").exists());
@@ -686,9 +704,14 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let mut reports: Vec<(f64, f64)> = Vec::new();
         let options = default_options();
-        merge_clips(&[a.clone(), b.clone()], &output, OutputMode::Overlay, &options, &stop, |done, total| {
-            reports.push((done, total))
-        })
+        merge_clips(
+            &[a.clone(), b.clone()],
+            &output,
+            OutputMode::Overlay,
+            &options,
+            &stop,
+            |done, total| reports.push((done, total)),
+        )
         .unwrap();
 
         let expected_total = duration_of(&a) + duration_of(&b);
@@ -697,7 +720,10 @@ mod tests {
             (last_total - expected_total).abs() < 0.35,
             "reported total {last_total}s vs expected {expected_total}s"
         );
-        assert!((last_done - last_total).abs() < 1e-6, "merge ended at {last_done}s of {last_total}s");
+        assert!(
+            (last_done - last_total).abs() < 1e-6,
+            "merge ended at {last_done}s of {last_total}s"
+        );
         assert!(reports.iter().all(|(done, _)| *done >= 0.0));
     }
 
@@ -719,14 +745,24 @@ mod tests {
 
         let output = dir.join("merged.mp4");
         let stop = Arc::new(AtomicBool::new(false));
-        let finished =
-            merge_clips(&[a, b], &output, OutputMode::Subtitles, &default_options(), &stop, |_, _| {}).unwrap();
+        let finished = merge_clips(
+            &[a, b],
+            &output,
+            OutputMode::Subtitles,
+            &default_options(),
+            &stop,
+            |_, _| {},
+        )
+        .unwrap();
 
         assert!(finished);
         let types = stream_types(&output);
         assert!(types.iter().any(|t| t == "video"), "{types:?}");
         assert!(types.iter().any(|t| t == "audio"), "{types:?}");
-        assert!(types.iter().any(|t| t == "subtitle"), "subtitle track was dropped: {types:?}");
+        assert!(
+            types.iter().any(|t| t == "subtitle"),
+            "subtitle track was dropped: {types:?}"
+        );
     }
 
     #[test]
@@ -739,8 +775,15 @@ mod tests {
         let output = dir.join("merged.mp4");
 
         let stop = Arc::new(AtomicBool::new(false));
-        let finished =
-            merge_clips(&[a.clone(), b.clone()], &output, OutputMode::Overlay, &default_options(), &stop, |_, _| {}).unwrap();
+        let finished = merge_clips(
+            &[a.clone(), b.clone()],
+            &output,
+            OutputMode::Overlay,
+            &default_options(),
+            &stop,
+            |_, _| {},
+        )
+        .unwrap();
 
         assert!(finished);
         let info = probe_video(&output).unwrap();
@@ -760,7 +803,15 @@ mod tests {
         let output = dir.join("merged.mp4");
 
         let stop = Arc::new(AtomicBool::new(false));
-        let err = merge_clips(&[a, b], &output, OutputMode::Subtitles, &default_options(), &stop, |_, _| {}).unwrap_err();
+        let err = merge_clips(
+            &[a, b],
+            &output,
+            OutputMode::Subtitles,
+            &default_options(),
+            &stop,
+            |_, _| {},
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("subtitle mode"), "unexpected error: {err}");
     }
 

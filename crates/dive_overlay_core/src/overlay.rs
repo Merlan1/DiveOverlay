@@ -100,16 +100,27 @@ fn last_known_value(samples_up_to_now: &[DiveSample], field: Field) -> Option<St
 /// extrapolates: before the first logged value there's nothing to show, and
 /// after the last one this carries it forward, same as the non-interpolated
 /// path.
-fn interpolated_value(samples: &[DiveSample], times: &[f64], dive_sec: f64, idx: usize, field: Field) -> Option<String> {
-    let before_idx = (0..=idx).rev().find(|&j| field_raw_value(&samples[j], field).is_some())?;
+fn interpolated_value(
+    samples: &[DiveSample],
+    times: &[f64],
+    dive_sec: f64,
+    idx: usize,
+    field: Field,
+) -> Option<String> {
+    let before_idx = (0..=idx)
+        .rev()
+        .find(|&j| field_raw_value(&samples[j], field).is_some())?;
     let before = (times[before_idx], field_raw_value(&samples[before_idx], field).unwrap());
     let after_idx = (idx + 1..times.len()).find(|&j| field_raw_value(&samples[j], field).is_some());
 
     let value = match after_idx {
         Some(after_idx) if times[after_idx] > before.0 => {
             let after = (times[after_idx], field_raw_value(&samples[after_idx], field).unwrap());
-            let prev = (0..before_idx).rev().find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)));
-            let next = (after_idx + 1..times.len()).find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)));
+            let prev = (0..before_idx)
+                .rev()
+                .find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)));
+            let next =
+                (after_idx + 1..times.len()).find_map(|j| field_raw_value(&samples[j], field).map(|v| (times[j], v)));
             cubic_hermite(dive_sec, prev, before, after, next)
         }
         _ => before.1,
@@ -245,7 +256,15 @@ fn render_tile(lines: &[String], x: i32, y: i32, metrics: &OverlayMetrics) -> Ca
 
     let mut text_y = padding / 2;
     for line in lines {
-        draw_text_mut(&mut tile, Rgba([230, 245, 255, 255]), padding, text_y, scale, font, line);
+        draw_text_mut(
+            &mut tile,
+            Rgba([230, 245, 255, 255]),
+            padding,
+            text_y,
+            scale,
+            font,
+            line,
+        );
         text_y += metrics.line_height;
     }
 
@@ -516,7 +535,10 @@ mod tests {
         // segment's own secant (0..10 -> 10), so the curve should bow below
         // the segment's linear midpoint (5.0) rather than sitting on it.
         let value = cubic_hermite(15.0, Some((0.0, 0.0)), (10.0, 0.0), (20.0, 10.0), None);
-        assert!(value < 5.0, "expected the fitted curve to diverge from the linear midpoint, got {value}");
+        assert!(
+            value < 5.0,
+            "expected the fitted curve to diverge from the linear midpoint, got {value}"
+        );
     }
 
     #[test]
@@ -549,7 +571,10 @@ mod tests {
         let tile_ptr_before = cache.tile.as_ref().unwrap().image.as_raw().as_ptr();
         draw_overlay(&mut img, &lines, &mut cache);
         let tile_ptr_after = cache.tile.as_ref().unwrap().image.as_raw().as_ptr();
-        assert_eq!(tile_ptr_before, tile_ptr_after, "unchanged lines must reuse the cached tile");
+        assert_eq!(
+            tile_ptr_before, tile_ptr_after,
+            "unchanged lines must reuse the cached tile"
+        );
 
         let other_lines = vec!["Dive time: 00:20".to_string(), "Depth: 2.0 m".to_string()];
         draw_overlay(&mut img, &other_lines, &mut cache);

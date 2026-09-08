@@ -1,0 +1,22 @@
+# Formatting for the workspace. Stable-rustfmt options only, so plain
+# `cargo fmt` works without a nightly toolchain.
+
+edition = "2021"
+
+# The codebase was written at 120 columns, not rustfmt's 100: over a hundred
+# existing lines sit between the two, and most are signatures whose arguments
+# read better on one line than split across four. Narrowing to the default
+# would reformat far more than it improved.
+max_width = 120
+
+# Keep `use` statements sorted and grouped, which they already are by hand.
+reorder_imports = true
+reorder_modules = true
+
+# Left at rustfmt's default ("Auto", i.e. match whatever each file already
+# uses) on purpose. This repo is developed on Windows with core.autocrlf=true,
+# so git writes CRLF into the working tree on every checkout; pinning "Unix"
+# here makes `cargo fmt --check` fail immediately after any `git checkout`,
+# which is intolerable when formatting is a pre-commit step. Git still stores
+# LF in the object database, so the committed files are unaffected.
+use_field_init_shorthand = true

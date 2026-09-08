@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use dive_overlay_core::csv_data::{
-    format_duration, format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds,
-    parse_fields,
+    format_duration, format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds, parse_fields,
 };
 use dive_overlay_core::ffprobe::probe_video;
 use dive_overlay_core::merge::{finish_merge, plan_merge, MergePlan};
@@ -324,9 +323,14 @@ impl App {
     }
 
     fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
-        let Some((version, url)) = &self.update_available else { return };
+        let Some((version, url)) = &self.update_available else {
+            return;
+        };
         ui.horizontal(|ui| {
-            ui.colored_label(egui::Color32::from_rgb(184, 92, 0), format!("New version available: {version}"));
+            ui.colored_label(
+                egui::Color32::from_rgb(184, 92, 0),
+                format!("New version available: {version}"),
+            );
             ui.hyperlink_to("Download", url);
         });
         ui.separator();
@@ -405,8 +409,16 @@ impl App {
                         .selected_text(self.preset.clone())
                         .show_ui(ui, |ui| {
                             for opt in [
-                                "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower",
-                                "veryslow", "placebo",
+                                "ultrafast",
+                                "superfast",
+                                "veryfast",
+                                "faster",
+                                "fast",
+                                "medium",
+                                "slow",
+                                "slower",
+                                "veryslow",
+                                "placebo",
                             ] {
                                 ui.selectable_value(&mut self.preset, opt.to_string(), opt);
                             }
@@ -449,7 +461,9 @@ impl App {
             });
         });
         if self.merge_enabled {
-            ui.weak("Sorted by dive time, joined back-to-back with no filler for the gaps. Only the combined file is kept.");
+            ui.weak(
+                "Sorted by dive time, joined back-to-back with no filler for the gaps. Only the combined file is kept.",
+            );
         }
 
         ui.checkbox(&mut self.auto_sync, "Auto-sync clips from their recording timestamps");
@@ -468,7 +482,10 @@ impl App {
 
             ui.horizontal(|ui| {
                 ui.label("Base clip:");
-                let selected_text = names.get(base_clip_index).cloned().unwrap_or_else(|| "<none>".to_string());
+                let selected_text = names
+                    .get(base_clip_index)
+                    .cloned()
+                    .unwrap_or_else(|| "<none>".to_string());
                 egui::ComboBox::from_id_salt("base_clip")
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
@@ -674,7 +691,8 @@ impl App {
                             dialog.video = path.display().to_string();
                             if dialog.output.trim().is_empty() {
                                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-                                dialog.output = path.with_file_name(format!("{stem}_overlay.mp4")).display().to_string();
+                                dialog.output =
+                                    path.with_file_name(format!("{stem}_overlay.mp4")).display().to_string();
                             }
                         }
                     }
@@ -829,7 +847,11 @@ impl App {
         } else if reload {
             self.render_preview(clip_index, ctx);
         } else if csv_sync_edited {
-            let text = self.preview.as_ref().map(|p| p.csv_sync_edit.clone()).unwrap_or_default();
+            let text = self
+                .preview
+                .as_ref()
+                .map(|p| p.csv_sync_edit.clone())
+                .unwrap_or_default();
             match parse_duration_to_seconds(&text) {
                 Ok(_) => {
                     if let Some(entry) = self.entries.get_mut(clip_index) {
@@ -998,11 +1020,14 @@ impl App {
         };
         ui.add(egui::ProgressBar::new(self.progress / 100.0).text(bar_text));
 
-        egui::ScrollArea::vertical().max_height(150.0).stick_to_bottom(true).show(ui, |ui| {
-            for line in &self.log_lines {
-                ui.label(line);
-            }
-        });
+        egui::ScrollArea::vertical()
+            .max_height(150.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in &self.log_lines {
+                    ui.label(line);
+                }
+            });
     }
 
     fn start_processing(&mut self, ctx: &egui::Context) {
@@ -1016,7 +1041,8 @@ impl App {
             return;
         }
         if !csv_path.exists() {
-            self.log_lines.push(format!("Error: CSV not found: {}", csv_path.display()));
+            self.log_lines
+                .push(format!("Error: CSV not found: {}", csv_path.display()));
             return;
         }
         if self.entries.is_empty() {
@@ -1070,7 +1096,8 @@ impl App {
 
         let auto_sync = if self.auto_sync {
             let Some(entry) = self.entries.get(self.base_clip_index) else {
-                self.log_lines.push("Error: please select a base clip for auto-sync.".to_string());
+                self.log_lines
+                    .push("Error: please select a base clip for auto-sync.".to_string());
                 return;
             };
             let Ok(base_video_sync_sec) = self.base_video_sync.trim().parse::<f64>() else {
@@ -1298,19 +1325,26 @@ fn run_worker(
         let mut last_sent = std::time::Instant::now();
         // The merge reports its position ten times a second; repainting the
         // UI that often for a bar that moves slowly is wasted work.
-        let merged = finish_merge(plan, merge_output, options.mode, &options, cancel_flag, move |done, total| {
-            if total <= 0.0 || (last_sent.elapsed().as_secs_f64() < 0.25 && done < total) {
-                return;
-            }
-            let _ = tx_merge.send(WorkerEvent::Progress((done * 100.0 / total).min(100.0) as f32));
-            let _ = tx_merge.send(WorkerEvent::Status(format!(
-                "Combining clips... {} / {}",
-                format_duration(done.min(total)),
-                format_duration(total)
-            )));
-            ctx_merge.request_repaint();
-            last_sent = std::time::Instant::now();
-        })
+        let merged = finish_merge(
+            plan,
+            merge_output,
+            options.mode,
+            &options,
+            cancel_flag,
+            move |done, total| {
+                if total <= 0.0 || (last_sent.elapsed().as_secs_f64() < 0.25 && done < total) {
+                    return;
+                }
+                let _ = tx_merge.send(WorkerEvent::Progress((done * 100.0 / total).min(100.0) as f32));
+                let _ = tx_merge.send(WorkerEvent::Status(format!(
+                    "Combining clips... {} / {}",
+                    format_duration(done.min(total)),
+                    format_duration(total)
+                )));
+                ctx_merge.request_repaint();
+                last_sent = std::time::Instant::now();
+            },
+        )
         .map_err(|e| format!("{e}{}", parts_note(Some(plan))))?;
         if !merged {
             let _ = tx.send(WorkerEvent::Log(format!(
@@ -1468,11 +1502,7 @@ mod tests {
         let first = synth_clip(&dir, "first.mp4", 1, 10);
         let second = synth_clip(&dir, "second.mp4", 1, 10);
         let csv_path = dir.join("dive.csv");
-        std::fs::write(
-            &csv_path,
-            "sample time (min),sample depth (m)\n0:00,1.0\n5:00,20.0\n",
-        )
-        .unwrap();
+        std::fs::write(&csv_path, "sample time (min),sample depth (m)\n0:00,1.0\n5:00,20.0\n").unwrap();
         let merged = dir.join("dive_full.mp4");
 
         // Listed later-clip-first on purpose: the merge has to reorder them.

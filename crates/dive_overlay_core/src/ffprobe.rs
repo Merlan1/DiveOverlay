@@ -134,19 +134,13 @@ pub fn parse_creation_time(text: &str) -> Result<DateTime<Utc>, CoreError> {
         }
     }
 
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-    ] {
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(text, fmt) {
             return Ok(DateTime::from_naive_utc_and_offset(naive, Utc));
         }
     }
 
-    Err(CoreError::Ffprobe(format!(
-        "Unknown creation_time format: {text}"
-    )))
+    Err(CoreError::Ffprobe(format!("Unknown creation_time format: {text}")))
 }
 
 /// Parses an `HH:MM:SS:FF` (or `;FF` for drop-frame) SMPTE timecode into
@@ -257,10 +251,7 @@ fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoInfo, CoreError> {
         .or_else(|| parsed.format.as_ref().and_then(|f| f.duration.as_deref()))
         .and_then(|s| s.parse::<f64>().ok());
 
-    let has_audio = parsed
-        .streams
-        .iter()
-        .any(|s| s.codec_type.as_deref() == Some("audio"));
+    let has_audio = parsed.streams.iter().any(|s| s.codec_type.as_deref() == Some("audio"));
 
     Ok(VideoInfo {
         width,
@@ -291,9 +282,8 @@ pub fn probe_video(video_path: &Path) -> Result<VideoInfo, CoreError> {
 
 pub fn get_video_creation_time_utc(video_path: &Path) -> Result<DateTime<Utc>, CoreError> {
     let info = probe_video(video_path)?;
-    info.creation_time.ok_or_else(|| {
-        CoreError::Ffprobe(format!("No creation_time in MP4: {}", video_path.display()))
-    })
+    info.creation_time
+        .ok_or_else(|| CoreError::Ffprobe(format!("No creation_time in MP4: {}", video_path.display())))
 }
 
 #[cfg(test)]
@@ -445,13 +435,7 @@ mod tests {
         let path = dir.join("tc.mp4");
 
         let status = std::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=size=64x64:rate=30:duration=1",
-            ])
+            .args(["-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=30:duration=1"])
             .args(["-timecode", "12:40:24:19"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&path)

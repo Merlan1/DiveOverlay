@@ -178,8 +178,14 @@ const ENABLED_HW_CANDIDATES: &[HwEncoder] = &[HwEncoder::Qsv, HwEncoder::Nvenc, 
 /// detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncoderInfo {
-    Hardware { backend: &'static str, ffmpeg_name: &'static str },
-    Software { ffmpeg_name: &'static str, preset: Option<&'static str> },
+    Hardware {
+        backend: &'static str,
+        ffmpeg_name: &'static str,
+    },
+    Software {
+        ffmpeg_name: &'static str,
+        preset: Option<&'static str>,
+    },
     Remux,
 }
 
@@ -187,10 +193,16 @@ impl EncoderInfo {
     pub fn describe(&self) -> String {
         match self {
             EncoderInfo::Hardware { backend, ffmpeg_name } => format!("Hardware: {backend} ({ffmpeg_name})"),
-            EncoderInfo::Software { ffmpeg_name, preset: Some(p) } => {
+            EncoderInfo::Software {
+                ffmpeg_name,
+                preset: Some(p),
+            } => {
                 format!("Software: {ffmpeg_name} (Preset: {p})")
             }
-            EncoderInfo::Software { ffmpeg_name, preset: None } => format!("Software: {ffmpeg_name}"),
+            EncoderInfo::Software {
+                ffmpeg_name,
+                preset: None,
+            } => format!("Software: {ffmpeg_name}"),
             EncoderInfo::Remux => "No re-encode (subtitle mode)".to_string(),
         }
     }
@@ -243,7 +255,12 @@ fn run_hw_encoder_probe(encoder_name: &str, pix_fmt: &str, width: u32, height: u
     }
     Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .args(["-f", "lavfi", "-i", &format!("nullsrc=size={width}x{height}:rate=5:duration=0.2")])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("nullsrc=size={width}x{height}:rate=5:duration=0.2"),
+        ])
         .args(["-frames:v", "1", "-c:v", encoder_name, "-pix_fmt", pix_fmt])
         .args(["-f", "null", "-"])
         .stdin(Stdio::null())
@@ -435,7 +452,11 @@ impl OutputResolution {
 /// is rejected by the encoder outright.
 fn round_to_even(value: f64) -> u32 {
     let rounded = value.round().max(2.0) as u32;
-    let even = if rounded.is_multiple_of(2) { rounded } else { rounded - 1 };
+    let even = if rounded.is_multiple_of(2) {
+        rounded
+    } else {
+        rounded - 1
+    };
     even.max(2)
 }
 
@@ -1011,8 +1032,16 @@ mod tests {
             interpolate: false,
             resolution: OutputResolution::Original,
         };
-        let err = process_clip(&job, &[], &[], &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
-            .unwrap_err();
+        let err = process_clip(
+            &job,
+            &[],
+            &[],
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("must differ"), "unexpected error: {err}");
         // The input must be untouched.
         assert!(probe_video(&clip).is_ok());
@@ -1043,8 +1072,16 @@ mod tests {
             interpolate: false,
             resolution: OutputResolution::Original,
         };
-        let err = process_clip(&job, &[], &[], &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
-            .unwrap_err();
+        let err = process_clip(
+            &job,
+            &[],
+            &[],
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap_err();
         let text = err.to_string();
         assert!(
             text.contains('\n') && text.lines().count() >= 2,
@@ -1089,14 +1126,24 @@ mod tests {
             interpolate: false,
             resolution: OutputResolution::Original,
         };
-        let completed =
-            process_clip(&job, &samples, &times, &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
-                .unwrap();
+        let completed = process_clip(
+            &job,
+            &samples,
+            &times,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
         assert!(completed);
 
         let info = probe_video(&output).unwrap();
         assert_eq!((info.width, info.height), (120, 160));
-        assert_eq!(info.rotation_deg, 0, "output pixels are already upright; no rotation tag expected");
+        assert_eq!(
+            info.rotation_deg, 0,
+            "output pixels are already upright; no rotation tag expected"
+        );
     }
 
     /// Variable-frame-rate input: the decoder must emit exactly
@@ -1136,12 +1183,23 @@ mod tests {
             interpolate: false,
             resolution: OutputResolution::Original,
         };
-        process_clip(&job, &samples, &times, &options, &Arc::new(AtomicBool::new(false)), |_, _| {}, |_| {})
-            .unwrap();
+        process_clip(
+            &job,
+            &samples,
+            &times,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
 
         let info = probe_video(&output).unwrap();
         let duration = info.duration_sec.expect("output duration");
-        assert!((duration - 1.9).abs() < 0.25, "expected ~1.9s of video, got {duration}s");
+        assert!(
+            (duration - 1.9).abs() < 0.25,
+            "expected ~1.9s of video, got {duration}s"
+        );
     }
 
     #[test]
@@ -1164,10 +1222,7 @@ mod tests {
         assert_eq!(OutputResolution::Uhd4k.target_dimensions(5312, 2988), (3840, 2160));
         assert_eq!(OutputResolution::Fhd1080p.target_dimensions(5312, 2988), (1920, 1080));
         assert_eq!(OutputResolution::Hd720p.target_dimensions(5312, 2988), (1280, 720));
-        assert_eq!(
-            OutputResolution::Original.target_dimensions(5312, 2988),
-            (5312, 2988)
-        );
+        assert_eq!(OutputResolution::Original.target_dimensions(5312, 2988), (5312, 2988));
     }
 
     /// Selecting a rung larger than the source must not upscale: a blurry
@@ -1310,7 +1365,16 @@ mod tests {
     #[test]
     fn preset_parse_round_trips_all_known_values() {
         let names = [
-            "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo",
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+            "placebo",
         ];
         for name in names {
             assert_eq!(Preset::parse(name).unwrap().ffmpeg_name(), name);
@@ -1382,23 +1446,14 @@ mod tests {
 
     #[test]
     fn hw_encoder_maps_amf_names_and_quality_args() {
-        assert_eq!(
-            HwEncoder::Amf.ffmpeg_encoder_name(Codec::Auto),
-            Some("h264_amf")
-        );
-        assert_eq!(
-            HwEncoder::Amf.ffmpeg_encoder_name(Codec::H265),
-            Some("hevc_amf")
-        );
+        assert_eq!(HwEncoder::Amf.ffmpeg_encoder_name(Codec::Auto), Some("h264_amf"));
+        assert_eq!(HwEncoder::Amf.ffmpeg_encoder_name(Codec::H265), Some("hevc_amf"));
         // AMF ignores -global_quality; it needs its own CQP rate control.
         assert_eq!(
             HwEncoder::Amf.quality_args(),
             vec!["-rc", "cqp", "-qp_i", "23", "-qp_p", "23"]
         );
-        assert_eq!(
-            HwEncoder::Qsv.quality_args(),
-            vec!["-global_quality", "23"]
-        );
+        assert_eq!(HwEncoder::Qsv.quality_args(), vec!["-global_quality", "23"]);
         assert!(ENABLED_HW_CANDIDATES.contains(&HwEncoder::Amf));
     }
 
@@ -1478,9 +1533,17 @@ mod tests {
         let stop_flag = Arc::new(AtomicBool::new(false));
 
         let mut encoder_info = None;
-        let completed = process_clip(&job, &samples, &times, &options, &stop_flag, |_, _| {}, |info| {
-            encoder_info = Some(info.clone());
-        })
+        let completed = process_clip(
+            &job,
+            &samples,
+            &times,
+            &options,
+            &stop_flag,
+            |_, _| {},
+            |info| {
+                encoder_info = Some(info.clone());
+            },
+        )
         .unwrap();
 
         assert!(completed);
@@ -1557,7 +1620,13 @@ mod tests {
             |info| encoder_info = Some(info.clone()),
         )
         .unwrap();
-        assert!(matches!(encoder_info, Some(EncoderInfo::Software { ffmpeg_name: "libx264", .. })));
+        assert!(matches!(
+            encoder_info,
+            Some(EncoderInfo::Software {
+                ffmpeg_name: "libx264",
+                ..
+            })
+        ));
 
         assert!(completed);
         assert!(output.exists());
@@ -1568,7 +1637,14 @@ mod tests {
 
         // Verify audio survived the mux.
         let ffprobe_out = Command::new("ffprobe")
-            .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type"])
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+            ])
             .args(["-of", "csv=p=0"])
             .arg(&output)
             .output()
@@ -1656,13 +1732,23 @@ mod tests {
         assert!(output.exists());
 
         let ffprobe_out = Command::new("ffprobe")
-            .args(["-v", "error", "-select_streams", "v", "-show_entries", "stream=codec_name"])
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "stream=codec_name",
+            ])
             .args(["-of", "csv=p=0"])
             .arg(&output)
             .output()
             .unwrap();
         let codec_name = String::from_utf8_lossy(&ffprobe_out.stdout);
-        assert!(codec_name.trim().contains("hevc"), "expected hevc codec, got: {codec_name}");
+        assert!(
+            codec_name.trim().contains("hevc"),
+            "expected hevc codec, got: {codec_name}"
+        );
     }
 
     #[test]
@@ -1707,7 +1793,14 @@ mod tests {
         assert_eq!(info.height, 120);
 
         let ffprobe_out = Command::new("ffprobe")
-            .args(["-v", "error", "-select_streams", "s", "-show_entries", "stream=codec_type"])
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=codec_type",
+            ])
             .args(["-of", "csv=p=0"])
             .arg(&output)
             .output()

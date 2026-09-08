@@ -105,8 +105,8 @@ pub fn concat_srt(parts: &[SrtPart<'_>]) -> Result<String, CoreError> {
                 }
             }
 
-            let timing = timing
-                .ok_or_else(|| CoreError::Other(format!("Malformed SRT block (no timing line): {block}")))?;
+            let timing =
+                timing.ok_or_else(|| CoreError::Other(format!("Malformed SRT block (no timing line): {block}")))?;
             let (start, end) = timing
                 .split_once("-->")
                 .ok_or_else(|| CoreError::Other(format!("Malformed SRT timing line: {timing}")))?;
@@ -217,7 +217,10 @@ mod tests {
 
         assert_eq!(merged.matches(" --> ").count(), 3);
         // Cue numbers keep climbing across the seam rather than restarting.
-        assert!(merged.contains("3\n00:00:02,000 --> 00:00:03,000\nDepth: 9.0 m"), "{merged}");
+        assert!(
+            merged.contains("3\n00:00:02,000 --> 00:00:03,000\nDepth: 9.0 m"),
+            "{merged}"
+        );
         assert!(merged.starts_with("1\n00:00:00,000 --> 00:00:01,000\nDepth: 1.0 m"));
     }
 
@@ -252,6 +255,9 @@ mod tests {
             offset_sec: 0.0,
         }])
         .unwrap_err();
-        assert!(err.to_string().contains("Malformed SRT block"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("Malformed SRT block"),
+            "unexpected error: {err}"
+        );
     }
 }

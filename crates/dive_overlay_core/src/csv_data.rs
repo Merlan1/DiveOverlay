@@ -165,10 +165,12 @@ pub fn read_csv_datetime_columns(
         .or_else(|| find_column_index(&headers, &ELAPSED_TIME_CANDIDATES));
     let date_idx = resolve_from_map(column_map, &headers, "date")?
         .or_else(|| find_column_index(&headers, &["date", "datum", "sample date"]));
-    let clock_idx = resolve_from_map(column_map, &headers, "clock")?.or_else(|| {
-        find_column_index_excluding(&headers, &["time", "zeit", "clock time", "clock"], elapsed_idx)
-    });
-    Ok((date_idx.map(|i| headers[i].clone()), clock_idx.map(|i| headers[i].clone())))
+    let clock_idx = resolve_from_map(column_map, &headers, "clock")?
+        .or_else(|| find_column_index_excluding(&headers, &["time", "zeit", "clock time", "clock"], elapsed_idx));
+    Ok((
+        date_idx.map(|i| headers[i].clone()),
+        clock_idx.map(|i| headers[i].clone()),
+    ))
 }
 
 /// Reads the first data row's values for the given column names (by
@@ -198,7 +200,13 @@ pub fn read_first_row_columns(csv_path: &Path, columns: &[&str]) -> Result<Optio
 
     let values = indices
         .into_iter()
-        .map(|idx| idx.and_then(|i| record.get(i)).unwrap_or("").trim().trim_matches('"').to_string())
+        .map(|idx| {
+            idx.and_then(|i| record.get(i))
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .to_string()
+        })
         .collect();
     Ok(Some(values))
 }
@@ -291,7 +299,10 @@ pub fn load_samples(csv_path: &Path, column_map: &HashMap<String, String>) -> Re
     let depth_idx = resolve_from_map(column_map, &headers, "depth")?
         .or_else(|| find_column_index(&headers, &["sample depth (m)", "sample depth", "depth"]));
     let temp_idx = resolve_from_map(column_map, &headers, "temp")?.or_else(|| {
-        find_column_index(&headers, &["sample temperature (c)", "sample temperature", "temperature"])
+        find_column_index(
+            &headers,
+            &["sample temperature (c)", "sample temperature", "temperature"],
+        )
     });
     let pressure_idx = resolve_from_map(column_map, &headers, "pressure")?
         .or_else(|| find_column_index(&headers, &["sample pressure (bar)", "sample pressure", "pressure"]));
@@ -407,14 +418,21 @@ mod tests {
 
         // ...but a clock column with an unusual name still matches by substring.
         let path = dir.join("time_of_day.csv");
-        std::fs::write(&path, "date,sample time (min),Time of day,sample depth (m)\n2025-07-05,0:10,15:32:55,1.0\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "date,sample time (min),Time of day,sample depth (m)\n2025-07-05,0:10,15:32:55,1.0\n",
+        )
+        .unwrap();
         let (_, clock) = read_csv_datetime_columns(&path, &HashMap::new()).unwrap();
         assert_eq!(clock.as_deref(), Some("Time of day"));
 
         // Explicit overrides win over every heuristic.
         let path = dir.join("mapped.csv");
-        std::fs::write(&path, "D,C,sample time (min),sample depth (m)\n2025-07-05,15:32:55,0:10,1.0\n").unwrap();
+        std::fs::write(
+            &path,
+            "D,C,sample time (min),sample depth (m)\n2025-07-05,15:32:55,0:10,1.0\n",
+        )
+        .unwrap();
         let mut map = HashMap::new();
         map.insert("date".to_string(), "D".to_string());
         map.insert("clock".to_string(), "c".to_string());

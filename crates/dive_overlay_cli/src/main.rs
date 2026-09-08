@@ -8,8 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
 use dive_overlay_core::csv_data::{
-    format_duration, format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds,
-    parse_fields,
+    format_duration, format_duration_precise, load_samples, parse_column_map, parse_duration_to_seconds, parse_fields,
 };
 use dive_overlay_core::ffprobe::ensure_ffmpeg_available;
 use dive_overlay_core::merge::{finish_merge, plan_merge};
@@ -116,7 +115,11 @@ struct Args {
 
 fn build_jobs(args: &Args) -> Result<Vec<ClipJob>> {
     if !args.clip.is_empty() {
-        return args.clip.iter().map(|s| parse_clip_spec(s).map_err(Into::into)).collect();
+        return args
+            .clip
+            .iter()
+            .map(|s| parse_clip_spec(s).map_err(Into::into))
+            .collect();
     }
 
     let video = args
@@ -258,7 +261,14 @@ fn main() -> Result<()> {
                 if elapsed >= 0.1 {
                     let fps = done.saturating_sub(last_done) as f64 / elapsed;
                     if total_frames > 0 {
-                        print!("\r[{}/{}] Frame {}/{} ({:.1} fps)   ", i + 1, total, done, total_frames, fps);
+                        print!(
+                            "\r[{}/{}] Frame {}/{} ({:.1} fps)   ",
+                            i + 1,
+                            total,
+                            done,
+                            total_frames,
+                            fps
+                        );
                     } else {
                         print!("\r[{}/{}] Frame {} ({:.1} fps)   ", i + 1, total, done, fps);
                     }
